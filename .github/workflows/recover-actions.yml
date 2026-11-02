@@ -1,0 +1,83 @@
+name: Stop bucket exchange and retain learned state in Actions
+
+on:
+  push:
+    branches: [actions-recovery]
+    paths: ['.github/workflows/recover-actions.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  recover:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Stop the superseded training workflow
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const run_id = 41451160546;
+            const params = {owner: context.repo.owner, repo: context.repo.repo, run_id};
+            let run = (await github.rest.actions.getWorkflowRun(params)).data;
+            if (run.status !== 'completed') {
+              await github.rest.actions.cancelWorkflowRun(params);
+              for (let attempt = 0; attempt < 60; attempt++) {
+                await new Promise(resolve => setTimeout(resolve, 5000));
+                run = (await github.rest.actions.getWorkflowRun(params)).data;
+                if (run.status === 'completed') break;
+              }
+            }
+            if (run.status !== 'completed') throw new Error('The superseded training run is still active');
+            core.info(`Stopped run ${run_id}; recover only its already saved state.`);
+      - name: Recover the saved optimizer once without writing to Hugging Face
+        uses: actions/github-script@v7
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        with:
+          script: |
+            const fs = require('node:fs/promises');
+            const crypto = require('node:crypto');
+            const bucket = 'RabbitDaisuke/Wholebody-Pose73-20261102-a6fde3-exchange';
+            async function readObject(path) {
+              let url = `https://huggingface.co/buckets/${bucket}/resolve/${encodeURIComponent(path)}`;
+              for (let redirect = 0; redirect < 8; redirect++) {
+                const parsed = new URL(url);
+                if (parsed.protocol !== 'https:') throw new Error('Expected HTTPS storage URL');
+                const headers = parsed.hostname === 'huggingface.co'
+                  ? {Authorization: `Bearer ${process.env.HF_TOKEN}`, 'Cache-Control': 'no-cache'} : {};
+                const response = await fetch(url, {headers, redirect: 'manual'});
+                if ([301, 302, 303, 307, 308].includes(response.status)) {
+                  url = new URL(response.headers.get('location'), url).href;
+                  continue;
+                }
+                if (!response.ok) throw new Error(`Recovery read failed with HTTP ${response.status}`);
+                return Buffer.from(await response.arrayBuffer());
+              }
+              throw new Error('Too many storage redirects');
+            }
+            const pointer = JSON.parse((await readObject('state/latest.json')).toString('utf8'));
+            if (!/^state\/checkpoints\/[0-9]+-[a-f0-9]{64}\.pt$/.test(pointer.path)) {
+              throw new Error('Unexpected checkpoint pointer path');
+            }
+            const bytes = await readObject(pointer.path);
+            const digest = crypto.createHash('sha256').update(bytes).digest('hex');
+            if (digest !== pointer.sha256) throw new Error('Saved optimizer checksum mismatch');
+            await fs.mkdir('recovery', {recursive: true});
+            await fs.writeFile('recovery/latest.pt', bytes);
+            await fs.writeFile('recovery/recovery.json', JSON.stringify({
+              ...pointer, recovered_from_run: 41451160546,
+              recovery_run: context.runId, source_repository: `${context.repo.owner}/${context.repo.repo}`,
+              recovery_only: true, hugging_face_writes: 0
+            }, null, 2));
+            core.info(`Recovered learned common step ${pointer.step}, ${bytes.length} bytes, SHA256 ${digest}`);
+      - name: Retain the recovered model and optimizer in Actions
+        uses: actions/upload-artifact@v4
+        with:
+          name: recovered-common-optimizer
+          path: recovery/
+          retention-days: 7
+          compression-level: 0
+          if-no-files-found: error
