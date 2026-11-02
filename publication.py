@@ -7,19 +7,22 @@ import os
 from pathlib import Path
 
 from data import ensure_images
+from bucket_transport import Bucket
 from export_model import export
 from hub import Hub, atomic_write, json_bytes, load_tensors, sha256
 from joint_schema import COMPACT_COCO_IDS, COMPACT_JOINT_NAMES
+from training_layout import validate_contributions
 
 
 def publish_learned(config: dict, work: Path) -> None:
-    from train import ROOT, SOURCE_REPOSITORY, load_run_manifest, log, publish_progress, run_key, training_identity, unpack_prepared, utc_now
+    from train import (ROOT, SOURCE_REPOSITORY, load_run_manifest, log, publish_progress,
+                       read_checkpoint, run_key, training_identity, unpack_prepared, utc_now)
 
     checkpoint_hub = Hub(config["checkpoint_repo_id"])
-    revision = checkpoint_hub.head()
-    checkpoint_data = checkpoint_hub.read("state/latest.pt", revision=revision)
+    exchange = Bucket(config["exchange_bucket_id"])
+    checkpoint_data, checkpoint_pointer = read_checkpoint(exchange)
     checkpoint = load_tensors(checkpoint_data)
-    manifest = load_run_manifest(checkpoint_hub, config, persist=True)
+    manifest = load_run_manifest(exchange, config, persist=True)
     if checkpoint["training_identity"] != training_identity(config):
         raise RuntimeError("Publication configuration differs from the learned checkpoint")
     if checkpoint["step"] < manifest["target_step"]:
@@ -32,18 +35,17 @@ def publish_learned(config: dict, work: Path) -> None:
         raise RuntimeError("The epoch-derived training budget is incomplete; resume the durable optimizer state")
     if not checkpoint["lifter_warmup"]["completed"] or checkpoint["labels2d"] <= 0 or checkpoint["labels3d"] <= 0:
         raise RuntimeError("The supervised learning stages have not completed")
-    if any(checkpoint["contribution_counts"].get(str(rank), 0) != checkpoint["step"] for rank in range(config["workers"])):
-        raise RuntimeError("Every shared update must contain every worker's actual gradient contribution")
+    contributions = validate_contributions(checkpoint)
     if checkpoint["parallel_overlap_steps"] <= 0 or not checkpoint["resume_history"]:
         raise RuntimeError("Actual overlapping computation and checkpoint continuation have not both been recorded")
 
     data_root = work / "data"
-    prepared = checkpoint_hub.read("data/prepared.tar.gz", revision=revision)
+    prepared = exchange.read("data/prepared.tar.gz")
     if sha256(prepared) != checkpoint["data_sha256"]:
         raise ValueError("Publication data differs from training data")
     unpack_prepared(prepared, data_root)
     atomic_write(work / "latest.pt", checkpoint_data)
-    atomic_write(work / "initial.pt", checkpoint_hub.read("state/initial.pt", revision=revision))
+    atomic_write(work / "initial.pt", exchange.read("state/initial.pt"))
     ensure_images(data_root, split="val", workers=8)
     output = work / "release"
     publish_progress(config, work, {"stage": "held_out_accuracy_evaluation", "step": checkpoint["step"],
@@ -79,6 +81,9 @@ def publish_learned(config: dict, work: Path) -> None:
         "parallel_effective_epochs3d": source_epochs,
         "source_seen3d": checkpoint["source_seen3d"],
         "contribution_counts": checkpoint["contribution_counts"],
+        "contribution_validation": contributions,
+        "topology_history": checkpoint["topology_history"],
+        "transport_history": checkpoint.get("transport_history", []),
         "parallel_overlap_steps": checkpoint["parallel_overlap_steps"],
         "joint_schema": config["joint_schema"], "learned_2d_points": 73, "learned_3d_points": 73,
         "joint_names": list(COMPACT_JOINT_NAMES),
@@ -86,9 +91,10 @@ def publish_learned(config: dict, work: Path) -> None:
         "resume_history": checkpoint["resume_history"], "updates": checkpoint["history"],
         "budget_extensions": checkpoint.get("budget_extensions", []),
         "residual_calibration": checkpoint["calibration"],
-        "checkpoint_repository": config["checkpoint_repo_id"], "checkpoint_revision": revision,
+        "checkpoint_repository": config["checkpoint_repo_id"],
+        "checkpoint_bucket": config["exchange_bucket_id"], "checkpoint_pointer": checkpoint_pointer,
         "checkpoint_sha256": sha256(checkpoint_data), "data_sha256": checkpoint["data_sha256"],
-        "resources": "Two standard ubuntu-24.04 CPU runners per parallel phase; one CPU job for 3D warmup",
+        "resources": "Standard ubuntu-24.04 CPU runners: physical worker counts are recorded by step range in topology_history; one CPU job for 3D warmup",
         "quality_gate": metrics["quality_gate"],
         "inference_budget": metrics["inference_budget"],
         "limitations": "Whole-body 3D uses annotation/noise evaluation; actual held-out RGB-to-3D evaluation covers body12 on one ASP clip. GPU latency/utilization are not measured.",
@@ -178,7 +184,8 @@ tags:
 # Pose73 WholeBody: 73-point 2D and relative 3D
 
 This model was learned in [GitHub Actions]({report['actions_run_url']}).
-It contains {checkpoint['step']} shared AdamW updates with both parallel workers contributing to every update.
+It contains {checkpoint['step']} shared AdamW updates. Every worker assigned to each update's recorded topology contributed an actual gradient.
+The physical worker counts, transition steps and per-worker totals are recorded in [training_report.json](training_report.json).
 Their actual computation intervals overlap in {checkpoint['parallel_overlap_steps']} updates.
 2D training processed {checkpoint['samples_seen2d']} person crops, or {report['effective_epochs2d']:.3f} complete-dataset equivalents.
 Small-batch 3D warmup and subsequent parallel 3D training are counted separately in [training_report.json](training_report.json).

@@ -6,15 +6,19 @@ import hashlib
 import io
 import json
 import os
-import random
 import time
 from pathlib import Path
 from typing import Any
 
 import requests
+import httpx
 import torch
 from huggingface_hub import CommitOperationAdd, CommitOperationDelete, HfApi, hf_hub_url
 from huggingface_hub.errors import HfHubHTTPError, RepositoryNotFoundError
+from bucket_transport import _pause, _retry_delay
+
+
+HTTP_ERRORS = (requests.RequestException, HfHubHTTPError, httpx.HTTPError)
 
 
 def json_bytes(value: Any) -> bytes:
@@ -59,11 +63,11 @@ class Hub:
         for attempt in range(7):
             try:
                 return self.api.repo_info(self.repo_id, repo_type="model").sha
-            except requests.RequestException as error:
-                status = getattr(error.response, "status_code", None)
+            except HTTP_ERRORS as error:
+                status = getattr(getattr(error, "response", None), "status_code", None)
                 if (status is not None and not self._retryable(status)) or attempt == 6:
                     raise
-                time.sleep(min(30, 2 ** attempt) + random.random())
+                _pause(_retry_delay(getattr(error, "response", None), attempt), "repository-head", status)
         raise RuntimeError("Unreachable retry state")
 
     def read(self, path: str, revision: str = "main", optional: bool = False) -> bytes | None:
@@ -76,22 +80,23 @@ class Hub:
                 if response.status_code == 404 and optional:
                     return None
                 if self._retryable(response.status_code) and attempt < 6:
-                    time.sleep(min(30, 2 ** attempt) + random.random())
+                    _pause(_retry_delay(response, attempt), "repository-read", response.status_code)
                     continue
                 response.raise_for_status()
                 return response.content
             except requests.RequestException as error:
-                status = getattr(error.response, "status_code", None)
+                status = getattr(getattr(error, "response", None), "status_code", None)
                 if attempt == 6 or (status is not None and not self._retryable(status)):
                     raise
-                time.sleep(min(30, 2 ** attempt) + random.random())
+                _pause(_retry_delay(getattr(error, "response", None), attempt), "repository-read", status)
         raise RuntimeError("Unreachable retry state")
 
     def read_json(self, path: str, revision: str = "main", optional: bool = False) -> Any:
         data = self.read(path, revision, optional)
         return None if data is None else json.loads(data.decode("utf-8"))
 
-    def commit(self, files: dict[str, bytes | Path], message: str, *, delete_files: list[str] | None = None) -> str:
+    def commit(self, files: dict[str, bytes | Path], message: str, *, delete_files: list[str] | None = None,
+               wait_for_rate_limit: bool = True) -> str:
         """Atomically publish related files; retry only concurrent-head conflicts.
 
         Writers use distinct paths. The coordinator alone owns state/latest.pt.
@@ -111,11 +116,21 @@ class Hub:
                     repo_type="model", parent_commit=parent,
                 )
                 return result.oid
-            except requests.RequestException as error:
-                status = getattr(error.response, "status_code", None)
+            except HTTP_ERRORS as error:
+                status = getattr(getattr(error, "response", None), "status_code", None)
+                if status == 429 and not wait_for_rate_limit:
+                    raise
                 if (status is not None and not self._retryable(status)) or attempt == 8:
                     raise
-                time.sleep(min(30, 2 ** min(attempt, 4)) + random.random())
+                response = getattr(error, "response", None)
+                delay = _retry_delay(response, attempt)
+                if status == 429 and response is not None:
+                    # The Hub's commit quota can be hourly, independently of
+                    # the five-minute API limit. Never hammer it on short retries.
+                    detail = response.text.lower()
+                    if "commit" in detail and ("hour" in detail or "128" in detail):
+                        delay = max(delay, 3600.0)
+                _pause(delay, "repository-commit", status)
         raise RuntimeError("Unreachable retry state")
 
     def create_owned(self, source_repo: str, private: bool) -> None:

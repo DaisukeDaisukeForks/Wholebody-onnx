@@ -23,9 +23,9 @@ jobs:
     timeout-minutes: 360
     strategy:
       fail-fast: false
-      max-parallel: 2
+      max-parallel: 8
       matrix:
-        rank: [0, 1]
+        rank: [0, 1, 2, 3, 4, 5, 6, 7]
     outputs:
       remaining: ${{ steps.learn.outputs.remaining }}
     env:
@@ -40,7 +40,7 @@ jobs:
         with:
           persist-credentials: false
       - uses: ./.github/actions/python
-      - name: Apply both workers to the shared optimizer state
+      - name: Apply all worker gradients to the shared optimizer state
         id: learn
         run: python train.py worker --config train_config.json --work-dir work --phase ${{ inputs.phase }} --rank ${{ matrix.rank }}
       - name: Preserve actual worker contribution logs

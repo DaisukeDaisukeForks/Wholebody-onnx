@@ -82,11 +82,20 @@ The exporter optionally uses Microsoft's `onnxconverter-common==1.16.0`, distrib
 
 Changes to the exported artifact: convert only the extracted backbone/final-convolution segment to FP16 and rejoin it with the original FP32 input normalization and FP32 GAU/SimCC/lifter/geometry. Public input/output types remain FP32. The optional file is published only after it meets the same declared held-out quality criteria. Exact precision boundaries, file hashes, sizes, evaluation provider, and reused-metric scope are recorded. CPU evaluation can promote unsupported FP16 operators to FP32 and is not evidence of native GPU behavior or performance.
 
+## Training transport
+
+The transport uses [`huggingface_hub==1.33.0`](https://github.com/huggingface/huggingface_hub/tree/v1.33.0), distributed under [Apache-2.0](https://github.com/huggingface/huggingface_hub/blob/v1.33.0/LICENSE). Official references: [Storage Buckets](https://huggingface.co/docs/hub/storage-buckets) and the [versioned Python Bucket API](https://huggingface.co/docs/huggingface_hub/v1.33.0/guides/buckets). Buckets provide mutable object storage for training state and intermediate files. The client license does not replace the model/data licenses or the hosting service's terms.
+
+The revised training transport writes binary objects before their control JSON. Complete checkpoints use immutable per-update paths; a last-written pointer identifies the checkpoint and its SHA-256. Readers verify the referenced bytes. Gradients and per-round weight exchange use the private bucket; the private model repository receives phase backups and final candidates. This removes per-round Git commit creation. Service retry/reset delays remain respected.
+
+The execution layout changes from two physical workers with32 accumulation batches to eight with8, while retaining two logical data shards and their cursors. Global batches remain512 2D examples and4,160 3D examples. The saved common step17 and its AdamW state come from the completed two-worker updates of [run41444692224](https://github.com/DaisukeDaisuke/Wholebody-onnx/actions/runs/41444692224); at this revision, the eight-worker/bucket continuation has not yet run. This infrastructure change does not alter the pretrained-model or dataset attribution.
+
 ## Distribution
 
 Source: [DaisukeDaisuke/Wholebody-onnx](https://github.com/DaisukeDaisuke/Wholebody-onnx).
 
 - Intended public model: [RabbitDaisuke/Wholebody-Pose73-20261102-a6fde3](https://huggingface.co/RabbitDaisuke/Wholebody-Pose73-20261102-a6fde3).
-- Intended private training state: [RabbitDaisuke/Wholebody-Pose73-20261102-a6fde3-checkpoints](https://huggingface.co/RabbitDaisuke/Wholebody-Pose73-20261102-a6fde3-checkpoints).
+- Private phase backups and final candidates: [RabbitDaisuke/Wholebody-Pose73-20261102-a6fde3-checkpoints](https://huggingface.co/RabbitDaisuke/Wholebody-Pose73-20261102-a6fde3-checkpoints).
+- New private training exchange bucket: [RabbitDaisuke/Wholebody-Pose73-20261102-a6fde3-exchange](https://huggingface.co/buckets/RabbitDaisuke/Wholebody-Pose73-20261102-a6fde3-exchange).
 
-GitHub Actions creates these repositories. Their configured URLs do not imply completed training or publication. Published files include this notice, [MODEL_LICENSE.md](MODEL_LICENSE.md), the full `LICENSES/` directory, model/interface files, and actual run provenance. Upstream Apache rights and dataset conditions remain distinct from the publisher's additional model-release grant.
+GitHub Actions creates these repositories and the private bucket under RabbitDaisuke. Their configured URLs do not imply completed training or publication. Published files include this notice, [MODEL_LICENSE.md](MODEL_LICENSE.md), the full `LICENSES/` directory, model/interface files, and actual run provenance. Upstream Apache rights and dataset conditions remain distinct from the publisher's additional model-release grant.
