@@ -6,6 +6,7 @@ import argparse
 import hashlib
 import io
 import json
+import math
 import os
 import platform
 import signal
@@ -13,14 +14,16 @@ import tarfile
 import time
 import traceback
 from datetime import datetime, timezone
+from collections import Counter
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import torch
-from torch.utils.data import default_collate
+from torch.utils.data import DataLoader, default_collate
 
-from data import ASPsetDataset, CocoWholeBodyDataset, PREPARED_FILES, ensure_images, prepare_data
+from data import (CocoCalibrationDataset, CocoWholeBodyDataset, LEGACY_PREPARED_FILES,
+                  PREPARED_FILES, Unified3DDataset, ensure_images, prepare_data)
 from hub import Hub, atomic_write, json_bytes, load_tensors, sha256, tensor_bytes, wait_json
 from model import WholeBodyModel
 
@@ -46,6 +49,33 @@ def run_key() -> str:
     return value
 
 
+def earlier_attempts() -> list[str]:
+    run_id, attempt = run_key().rsplit("-", 1)
+    return [f"{run_id}-{number}" for number in range(int(attempt) - 1, 0, -1)]
+
+
+def load_run_manifest(hub: Hub, config: dict[str, Any], *, persist: bool) -> dict[str, Any]:
+    manifest = hub.read_json(f"runs/{run_key()}/bootstrap.json", optional=True)
+    if manifest is not None:
+        return manifest
+    # GitHub's 'Re-run failed jobs' retains a successful bootstrap from the
+    # earlier attempt. Only that same Actions run and exact source commit may
+    # supply its preparation; unrelated runs/repositories are never adopted.
+    for previous_key in earlier_attempts():
+        previous = hub.read_json(f"runs/{previous_key}/bootstrap.json", optional=True)
+        if previous is None:
+            continue
+        if (previous["source_sha"] != os.environ.get("GITHUB_SHA")
+                or previous["training_identity"] != training_identity(config)):
+            raise RuntimeError("The successful bootstrap belongs to different code or training configuration")
+        manifest = {**previous, "run_key": run_key(), "bootstrap_reused_from": previous_key}
+        if persist:
+            hub.commit({f"runs/{run_key()}/bootstrap.json": json_bytes(manifest)},
+                       "Reuse the same run's successful preparation during failed-job recovery")
+        return manifest
+    raise RuntimeError("No successful preparation exists for this Actions run; run the full workflow")
+
+
 def load_config(path: Path) -> dict[str, Any]:
     value = json.loads(path.read_text(encoding="utf-8"))
     if value["workers"] != 2:
@@ -56,9 +86,10 @@ def load_config(path: Path) -> dict[str, Any]:
 
 
 def training_identity(config: dict[str, Any]) -> str:
-    keys = ("workers", "seed", "batch2d", "batch3d", "accumulate", "loss3d_weight",
-            "learning_rate", "weight_decay", "clip_grad_norm", "model", "train_limit",
-            "val_limit", "max_3d_frames", "frame_stride", "joint_schema")
+    keys = ("workers", "seed", "batch2d", "accumulate", "loss3d_weight",
+            "pose_learning_rate", "lifter_learning_rate", "weight_decay", "clip_grad_norm",
+            "model", "train_limit", "val_limit", "max_3d_frames", "frame_stride", "joint_schema",
+            "lifter_warmup_epochs", "lifter_warmup_batch")
     return sha256(json_bytes({key: config[key] for key in keys}))
 
 
@@ -74,9 +105,18 @@ def log(work: Path, name: str, event: dict[str, Any]) -> None:
 
 def optimizer_for(model: WholeBodyModel, config: dict[str, Any]) -> torch.optim.AdamW:
     return torch.optim.AdamW(
-        [parameter for parameter in model.parameters() if parameter.requires_grad],
-        lr=config["learning_rate"], weight_decay=config["weight_decay"],
+        [{"params": list(model.pose.parameters()), "lr": config["pose_learning_rate"], "name": "pose"},
+         {"params": list(model.lifter.parameters()), "lr": config["lifter_learning_rate"], "name": "lifter"}],
+        weight_decay=config["weight_decay"],
     )
+
+
+def set_learning_rates(optimizer: torch.optim.AdamW, config: dict[str, Any], step: int, target: int) -> None:
+    warmup = max(1, min(100, target // 20))
+    fraction = min(1.0, step / max(1, target))
+    multiplier = min(1.0, (step + 1) / warmup) * (0.1 + 0.9 * 0.5 * (1 + math.cos(math.pi * fraction)))
+    for group in optimizer.param_groups:
+        group["lr"] = config[f"{group['name']}_learning_rate"] * multiplier
 
 
 def prepared_bundle(data_root: Path) -> bytes:
@@ -87,11 +127,12 @@ def prepared_bundle(data_root: Path) -> bytes:
     return memory.getvalue()
 
 
-def unpack_prepared(data: bytes, data_root: Path) -> None:
+def unpack_prepared(data: bytes, data_root: Path, *, legacy: bool = False) -> None:
     data_root.mkdir(parents=True, exist_ok=True)
     with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as archive:
         members = archive.getmembers()
-        if {entry.name for entry in members} != set(PREPARED_FILES):
+        expected = LEGACY_PREPARED_FILES if legacy else PREPARED_FILES
+        if {entry.name for entry in members} != set(expected):
             raise ValueError("Unexpected prepared-data archive members")
         for entry in members:
             if not entry.isfile():
@@ -102,6 +143,114 @@ def unpack_prepared(data: bytes, data_root: Path) -> None:
             atomic_write(data_root / entry.name, source.read())
 
 
+def learning_plan(config: dict[str, Any], data_root: Path, previous: dict[str, Any] | None = None) -> dict[str, Any]:
+    dataset2d = CocoWholeBodyDataset(data_root, "train")
+    dataset3d = Unified3DDataset(data_root, "train")
+    global_batch2d = config["workers"] * config["accumulate"] * config["batch2d"]
+    target = max(2, math.ceil(len(dataset2d) * config["epochs2d"] / global_batch2d))
+    # Equal-sized rank batches traverse disjoint complete shards. Use the larger
+    # shard to guarantee the requested number of passes for every 3D example.
+    batch3d = math.ceil(math.ceil(len(dataset3d) / config["workers"]) * config["epochs3d"]
+                        / (target * config["accumulate"]))
+    if previous is not None:
+        if (previous["samples2d"] != len(dataset2d) or previous["samples3d"] != len(dataset3d)
+                or previous["source_counts3d"] != dataset3d.source_counts
+                or previous["global_batch2d"] != global_batch2d):
+            raise RuntimeError("Cannot change datasets or sample cursors while extending training")
+        if (config["epochs2d"] < previous["requested_epochs2d"]
+                or config["epochs3d"] < previous["requested_epochs3d"]):
+            raise RuntimeError("A continuation may increase the learning budget but cannot reduce it")
+        # Preserve every cursor and the per-update task weighting. Increasing
+        # the requested epochs adds updates, never changes historical sampling.
+        batch3d = previous["batch3d"]
+        target = max(target, previous["target_step"],
+                     math.ceil(math.ceil(len(dataset3d) / config["workers"]) * config["epochs3d"]
+                               / (config["accumulate"] * batch3d)))
+    return {"target_step": target, "batch3d": max(1, batch3d),
+            "samples2d": len(dataset2d), "samples3d": len(dataset3d),
+            "source_counts3d": dataset3d.source_counts, "global_batch2d": global_batch2d,
+            "global_batch3d": config["workers"] * config["accumulate"] * max(1, batch3d),
+            "requested_epochs2d": config["epochs2d"], "requested_epochs3d": config["epochs3d"],
+            "phase_steps": max(1, math.ceil(target / config["planned_phases"])),
+            "sampling": "Continuous deterministic disjoint rank cursors; final batch may wrap into the next epoch."}
+
+
+def calibrate(model: WholeBodyModel, data_root: Path, config: dict[str, Any]) -> dict[str, Any]:
+    dataset = CocoCalibrationDataset(data_root, max_samples=config["calibration_samples"], seed=config["seed"])
+    batches = DataLoader(dataset, batch_size=config["batch2d"], shuffle=False, num_workers=0)
+    measured = model.calibrate_residuals(batches, max_samples=config["calibration_samples"])
+    return {**dataset.calibration_manifest, "retained_residuals": measured}
+
+
+def publish_progress(config: dict[str, Any], work: Path, value: dict[str, Any]) -> None:
+    """A small public progress record; never a release or an accuracy claim."""
+    status = {"utc": utc_now(), "source_repository": SOURCE_REPOSITORY,
+              "actions_run_url": f"https://github.com/{SOURCE_REPOSITORY}/actions/runs/{os.environ.get('GITHUB_RUN_ID')}",
+              "run_key": run_key(), "published_model": False, **value}
+    try:
+        Hub(config["hf_repo_id"]).commit({"training_status.json": json_bytes(status)},
+                                        f"Record real learning progress: {value['stage']}")
+    except Exception as error:
+        # The durable optimizer checkpoint, not this public display, controls
+        # recovery. A status transport problem must not discard learned work.
+        log(work, "status", {"event": "progress_display_unavailable", "error_type": type(error).__name__})
+
+
+def warmup_lifter(model: WholeBodyModel, optimizer: torch.optim.AdamW, checkpoint: dict[str, Any],
+                  config: dict[str, Any], data_root: Path, hub: Hub, work: Path) -> None:
+    """Real small-batch 3D learning before parallel image/3D fine-tuning.
+
+    This is one bootstrap job, explicitly reported separately from distributed
+    updates. Its optimizer moments are retained by the later common optimizer.
+    """
+    dataset = Unified3DDataset(data_root, "train")
+    batch_size = config["lifter_warmup_batch"]
+    target = math.ceil(len(dataset) * config["lifter_warmup_epochs"] / batch_size)
+    progress = checkpoint.setdefault("lifter_warmup", {
+        "step": 0, "target_step": target, "batch_size": batch_size,
+        "source_seen": {source: 0 for source in dataset.source_counts}, "labels3d": 0,
+        "completed": False, "parallel": False,
+    })
+    stream = ShardStream(dataset, 0, 1, config["seed"] + 7000001)
+    if progress["target_step"] != target:
+        raise RuntimeError("Warmup data/budget changed while resuming")
+    model.train()
+    for step in range(progress["step"], target):
+        torch.manual_seed(config["seed"] + 3000001 + step)
+        model.set_training_progress(min(1.0, (step + 1) / max(1, target // 3)))
+        set_learning_rates(optimizer, config, step, target)
+        batch = stream.batch(step * batch_size, batch_size)
+        optimizer.zero_grad(set_to_none=True)
+        loss, metrics = model.loss_3d(batch)
+        if not torch.isfinite(loss):
+            raise FloatingPointError("Non-finite supervised 3D warmup loss")
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.lifter.parameters(), config["clip_grad_norm"], error_if_nonfinite=True)
+        optimizer.step()
+        progress["step"] = step + 1
+        progress["labels3d"] += int(metrics["labeled3d"])
+        for source, count in Counter(batch["source"]).items():
+            progress["source_seen"][source] += count
+        progress["completed"] = progress["step"] >= target
+        if (step + 1) % 50 == 0 or step + 1 == target:
+            log(work, "bootstrap", {"event": "lifter_warmup", "step": step + 1,
+                                   "target_step": target, "metrics": {name: float(value) for name, value in metrics.items()},
+                                   "source_seen": progress["source_seen"]})
+        if (step + 1) % 250 == 0 or progress["completed"] or STOP_REQUESTED:
+            checkpoint["model"] = model.state_dict()
+            checkpoint["optimizer"] = optimizer.state_dict()
+            checkpoint["model_config"] = model.config
+            hub.commit({"state/latest.pt": tensor_bytes(checkpoint),
+                        "state/warmup.json": json_bytes(progress)},
+                       f"Save actual 3D warmup update {step + 1}/{target}")
+            publish_progress(config, work, {"stage": "3d_warmup", "step": step + 1,
+                                            "target_step": target, "parallel": False,
+                                            "source_seen": progress["source_seen"],
+                                            "training_batch_metrics": {name: float(value) for name, value in metrics.items()}})
+        if STOP_REQUESTED:
+            raise RuntimeError("Warmup interrupted after saving its optimizer checkpoint")
+
+
 def bootstrap(config: dict[str, Any], work: Path) -> None:
     if not os.environ.get("HF_TOKEN"):
         raise RuntimeError("HF_TOKEN is missing. Add the Hugging Face write token as this repository's Actions secret HF_TOKEN.")
@@ -109,6 +258,19 @@ def bootstrap(config: dict[str, Any], work: Path) -> None:
     publication_hub = Hub(config["hf_repo_id"])
     checkpoint_hub.create_owned(SOURCE_REPOSITORY, private=True)
     publication_hub.create_owned(SOURCE_REPOSITORY, private=False)
+    if publication_hub.read("wholebody.onnx", optional=True) is None:
+        notice = ("---\nlicense: other\nlicense_name: wholebody-research\nlicense_link: MODEL_LICENSE.md\n---\n"
+                  "# Pose73 learning in progress\n\n"
+                  "The actual training workflow is preparing and learning this model. An ONNX release is uploaded only after the declared part-wise accuracy and inference-cost criteria pass.\n\n"
+                  "[Actual progress](training_status.json) · [Source and Actions](https://github.com/DaisukeDaisuke/Wholebody-onnx)\n\n"
+                  f"Model distribution: https://huggingface.co/{config['hf_repo_id']}\n\n"
+                  "[Model license](MODEL_LICENSE.md) · [Credits and external distribution sources](THIRD_PARTY.md)\n")
+        initial_public_files = {"README.md": notice.encode("utf-8"),
+                                "MODEL_LICENSE.md": ROOT / "MODEL_LICENSE.md", "THIRD_PARTY.md": ROOT / "THIRD_PARTY.md"}
+        initial_public_files.update({path.relative_to(ROOT).as_posix(): path
+                                     for path in (ROOT / "LICENSES").rglob("*") if path.is_file()})
+        publication_hub.commit(initial_public_files, "Describe the new training run, distribution and licenses")
+    publish_progress(config, work, {"stage": "preparing_real_data"})
     head = checkpoint_hub.head()
     previous_bytes = checkpoint_hub.read("state/latest.pt", revision=head, optional=True)
     prepared = checkpoint_hub.read("data/prepared.tar.gz", revision=head, optional=True)
@@ -126,9 +288,10 @@ def bootstrap(config: dict[str, Any], work: Path) -> None:
         source_run = source_hub.read_json(f"runs/{source['run_key']}/bootstrap.json", revision=source_revision)
         if source_run["data_sha256"] != source["sha256"]:
             raise RuntimeError("Prepared-data provenance differs from the recorded preparation")
-        prepared = source_hub.read("data/prepared.tar.gz", revision=source_revision)
-        if sha256(prepared) != source["sha256"]:
+        source_bytes = source_hub.read("data/prepared.tar.gz", revision=source_revision)
+        if sha256(source_bytes) != source["sha256"]:
             raise RuntimeError("Reused prepared-data checksum mismatch")
+        unpack_prepared(source_bytes, data_root, legacy=True)
         log(work, "bootstrap", {"event": "reused_current_session_data", "source_revision": source_revision,
                                "source_run": source["run_key"], "sha256": source["sha256"]})
     if prepared is None:
@@ -141,31 +304,58 @@ def bootstrap(config: dict[str, Any], work: Path) -> None:
     else:
         unpack_prepared(prepared, data_root)
     data_digest = sha256(prepared)
+    previous_checkpoint = load_tensors(previous_bytes) if previous_bytes is not None else None
+    plan = learning_plan(config, data_root, previous_checkpoint["plan"] if previous_checkpoint else None)
+    checkpoint_hub.commit({"data/prepared.tar.gz": prepared,
+                           "data/dataset_manifest.json": data_root / "dataset_manifest.json"},
+                          "Save actual COCO, ASPset and H3WB training data")
     if previous_bytes is None:
         torch.manual_seed(config["seed"])
         model = WholeBodyModel(config["model"], pretrained=True)
+        calibration = calibrate(model, data_root, config)
         optimizer = optimizer_for(model, config)
         checkpoint = {
-            "format": 1, "source_repository": SOURCE_REPOSITORY,
+            "format": 2, "source_repository": SOURCE_REPOSITORY,
             "model": model.state_dict(), "model_config": model.config,
             "optimizer": optimizer.state_dict(), "step": 0,
             "training_identity": training_identity(config), "data_sha256": data_digest,
             "seed": config["seed"], "created_at": utc_now(),
             "contribution_counts": {str(rank): 0 for rank in range(config["workers"])},
             "labels2d": 0, "labels3d": 0, "parallel_overlap_steps": 0,
-            "history": [], "resume_history": [],
+            "history": [], "resume_history": [], "plan": plan,
+            "samples_seen2d": 0,
+            "source_seen3d": {source: 0 for source in plan["source_counts3d"]},
+            "calibration": calibration,
         }
         previous_bytes = tensor_bytes(checkpoint)
+        checkpoint_hub.commit({"state/initial.pt": previous_bytes,
+                               "state/latest.pt": previous_bytes,
+                               "data/residual_calibration.json": json_bytes(calibration)},
+                              "Save pose-pretrained compact73 initialization and training-only residual calibration")
     else:
-        checkpoint = load_tensors(previous_bytes)
+        checkpoint = previous_checkpoint
         if checkpoint["training_identity"] != training_identity(config):
             raise RuntimeError("Training/model configuration changed; cannot silently resume incompatible state")
         if checkpoint["data_sha256"] != data_digest:
             raise RuntimeError("Prepared training data differs from the checkpoint")
+        if checkpoint["plan"] != plan:
+            checkpoint.setdefault("budget_extensions", []).append({
+                "utc": utc_now(), "run_key": run_key(), "restored_step": checkpoint["step"],
+                "previous_plan": checkpoint["plan"], "extended_plan": plan,
+                "preserved": "Model, optimizer moments, exact per-task batch sizes and deterministic sample cursors",
+            })
+            checkpoint["plan"] = plan
+        model = WholeBodyModel(checkpoint["model_config"], pretrained=False)
+        model.load_state_dict(checkpoint["model"], strict=True)
+        optimizer = optimizer_for(model, config)
+        optimizer.load_state_dict(checkpoint["optimizer"])
+    warmup_lifter(model, optimizer, checkpoint, config, data_root, checkpoint_hub, work)
+    previous_bytes = tensor_bytes(checkpoint)
     manifest = {
         "run_key": run_key(), "source_repository": SOURCE_REPOSITORY,
         "source_sha": os.environ.get("GITHUB_SHA"), "initial_step": checkpoint["step"],
-        "target_step": checkpoint["step"] + 2 * config["rounds_per_phase"],
+        "target_step": plan["target_step"], "learning_plan": plan,
+        "lifter_warmup": checkpoint["lifter_warmup"],
         "data_sha256": data_digest, "training_identity": training_identity(config),
         "created_at": utc_now(), "workers": config["workers"],
     }
@@ -235,18 +425,21 @@ def gradient_packet(
     snapshot_hash: str, scheduled_start: float,
 ) -> dict[str, Any]:
     model.train()
+    model.set_training_progress(step / max(1, config["target_step"]))
     model.zero_grad(set_to_none=True)
     torch.manual_seed(config["seed"] + step * config["workers"] + rank)
     remaining = scheduled_start - time.time()
     if remaining > 0:
         time.sleep(min(remaining, 20))
     totals: dict[str, float] = {}
+    source_seen3d: Counter[str] = Counter()
     started = time.time()
     for microstep in range(config["accumulate"]):
         offset2d = (step * config["accumulate"] + microstep) * config["batch2d"]
         offset3d = (step * config["accumulate"] + microstep) * config["batch3d"]
         batch2d = stream2d.batch(offset2d, config["batch2d"])
         batch3d = stream3d.batch(offset3d, config["batch3d"])
+        source_seen3d.update(batch3d["source"])
         loss2d, metrics2d = model.loss_2d(batch2d)
         loss3d, metrics3d = model.loss_3d(batch3d)
         loss = (loss2d + config["loss3d_weight"] * loss3d) / config["accumulate"]
@@ -268,6 +461,7 @@ def gradient_packet(
         "snapshot_sha256": snapshot_hash, "parameters_sha256": parameter_digest(model),
         "samples2d": config["batch2d"] * config["accumulate"],
         "samples3d": config["batch3d"] * config["accumulate"],
+        "source_seen3d": dict(source_seen3d),
         "compute_started": started, "compute_finished": finished,
         "metrics": totals, "gradients": gradients,
     }
@@ -328,6 +522,7 @@ def apply_gradients(
         # mean(global 2D examples) + lambda * mean(global 3D examples).
         parameter.grad = torch.stack([packet["gradients"][name] for packet in packets]).mean(dim=0)
     norm = torch.nn.utils.clip_grad_norm_(list(parameters.values()), config["clip_grad_norm"], error_if_nonfinite=True)
+    set_learning_rates(optimizer, config, checkpoint["step"], checkpoint["plan"]["target_step"])
     optimizer.step()
     if not all(torch.isfinite(parameter).all() for parameter in parameters.values()):
         raise FloatingPointError("Optimizer produced non-finite model parameters")
@@ -336,6 +531,7 @@ def apply_gradients(
         "step": checkpoint["step"] + 1, "phase": phase, "run_key": run_key(),
         "gradient_norm_before_clip": float(norm), "compute_overlap_seconds": overlap,
         "base_snapshot_sha256": snapshot_hash,
+        "learning_rates": {group["name"]: group["lr"] for group in optimizer.param_groups},
         "contributors": [{key: value for key, value in packet.items() if key != "gradients"} for packet in packets],
     }
     checkpoint["step"] += 1
@@ -349,6 +545,14 @@ def apply_gradients(
         checkpoint["contribution_counts"][str(packet["worker_id"]) ] += 1
         checkpoint["labels2d"] += int(packet["metrics"]["labeled2d"])
         checkpoint["labels3d"] += int(packet["metrics"]["labeled3d"])
+        checkpoint["samples_seen2d"] += packet["samples2d"]
+        for source, count in packet["source_seen3d"].items():
+            checkpoint["source_seen3d"][source] += count
+    evidence["effective_epochs2d"] = checkpoint["samples_seen2d"] / checkpoint["plan"]["samples2d"]
+    evidence["effective_epochs3d"] = {
+        source: count / checkpoint["plan"]["source_counts3d"][source]
+        for source, count in checkpoint["source_seen3d"].items()
+    }
     return evidence
 
 
@@ -357,13 +561,51 @@ def worker(config: dict[str, Any], work: Path, phase: int, rank: int) -> None:
     prefix = f"runs/{run_key()}/phase{phase}"
     deadline = time.monotonic() + 60 * config["worker_minutes"]
     wait_seconds = 60 * config["worker_wait_minutes"]
-    bootstrap_manifest = hub.read_json(f"runs/{run_key()}/bootstrap.json")
+    bootstrap_manifest = load_run_manifest(hub, config, persist=rank == 0)
+    config = {**config, "batch3d": bootstrap_manifest["learning_plan"]["batch3d"],
+              "target_step": bootstrap_manifest["target_step"]}
+    data_root = work / "data"
+    for previous_key in earlier_attempts():
+        finished = hub.read_json(f"runs/{previous_key}/phase{phase}/finished.json", optional=True)
+        if finished is not None:
+            current = load_tensors(hub.read("state/latest.pt"))
+            if current["step"] < finished["step"]:
+                raise RuntimeError("Durable state precedes a previously completed phase")
+            write_worker_status(work, current["step"], bootstrap_manifest["target_step"])
+            return
+    model = optimizer = None
     if rank == 0:
         revision = hub.head()
-        checkpoint = load_tensors(hub.read("state/latest.pt", revision=revision))
+        checkpoint_data = hub.read("state/latest.pt", revision=revision)
+        checkpoint = load_tensors(checkpoint_data)
+        if not checkpoint["lifter_warmup"]["completed"]:
+            raise RuntimeError("The real 3D warmup budget is incomplete")
+        if checkpoint["step"] < bootstrap_manifest["target_step"]:
+            data_bytes = hub.read("data/prepared.tar.gz", revision=revision)
+            if sha256(data_bytes) != checkpoint["data_sha256"]:
+                raise ValueError("Worker data differs from the common checkpoint")
+            unpack_prepared(data_bytes, data_root)
+            model = WholeBodyModel(checkpoint["model_config"], pretrained=False)
+            model.load_state_dict(checkpoint["model"], strict=True)
+            optimizer = optimizer_for(model, config)
+            optimizer.load_state_dict(checkpoint["optimizer"])
+            if checkpoint["step"] > 0:
+                if not optimizer.state:
+                    raise RuntimeError("A trained checkpoint is missing its optimizer state")
+                checkpoint["resume_history"].append({
+                    "run_key": run_key(), "phase": phase, "restored_step": checkpoint["step"],
+                    "optimizer_state_entries": len(optimizer.state), "utc": utc_now(),
+                })
+                checkpoint["calibration"] = calibrate(model, data_root, config)
+                checkpoint["model"] = model.state_dict()
+            revision = hub.commit({"state/previous-phase.pt": checkpoint_data,
+                                   "state/latest.pt": tensor_bytes(checkpoint),
+                                   "data/residual_calibration.json": json_bytes(checkpoint["calibration"])},
+                                  f"Restore phase {phase} optimizer and share current training-data residuals")
         plan = {
             "checkpoint_revision": revision, "start_step": checkpoint["step"],
-            "target_step": bootstrap_manifest["initial_step"] + phase * config["rounds_per_phase"],
+            "target_step": min(bootstrap_manifest["target_step"], checkpoint["step"] + bootstrap_manifest["learning_plan"]["phase_steps"]),
+            "final_target_step": bootstrap_manifest["target_step"],
             "run_key": run_key(), "phase": phase,
         }
         hub.commit({f"{prefix}/plan.json": json_bytes(plan)}, f"Start phase {phase} from saved step {checkpoint['step']}")
@@ -375,25 +617,23 @@ def worker(config: dict[str, Any], work: Path, phase: int, rank: int) -> None:
         checkpoint = load_tensors(hub.read("state/latest.pt", revision=plan["checkpoint_revision"]))
     if checkpoint["training_identity"] != training_identity(config):
         raise ValueError("Worker configuration differs from the common checkpoint")
-    data_bytes = hub.read("data/prepared.tar.gz", revision=plan["checkpoint_revision"])
-    if sha256(data_bytes) != checkpoint["data_sha256"]:
-        raise ValueError("Worker data differs from the common checkpoint")
-    data_root = work / "data"
-    unpack_prepared(data_bytes, data_root)
+    if plan["start_step"] >= plan["final_target_step"]:
+        write_worker_status(work, plan["start_step"], plan["final_target_step"])
+        return
+    if rank != 0:
+        data_bytes = hub.read("data/prepared.tar.gz", revision=plan["checkpoint_revision"])
+        if sha256(data_bytes) != checkpoint["data_sha256"]:
+            raise ValueError("Worker data differs from the common checkpoint")
+        unpack_prepared(data_bytes, data_root)
+        model = WholeBodyModel(checkpoint["model_config"], pretrained=False)
+        model.load_state_dict(checkpoint["model"], strict=True)
+        optimizer = optimizer_for(model, config)
+        optimizer.load_state_dict(checkpoint["optimizer"])
     ensure_images(data_root, split="train", rank=rank, world_size=config["workers"], workers=8)
-    model = WholeBodyModel(checkpoint["model_config"], pretrained=False)
-    model.load_state_dict(checkpoint["model"], strict=True)
-    optimizer = optimizer_for(model, config)
-    optimizer.load_state_dict(checkpoint["optimizer"])
-    if rank == 0 and checkpoint["step"] > 0:
-        if not optimizer.state:
-            raise RuntimeError("A trained checkpoint is missing its optimizer state")
-        checkpoint["resume_history"].append({
-            "run_key": run_key(), "phase": phase, "restored_step": checkpoint["step"],
-            "optimizer_state_entries": len(optimizer.state), "utc": utc_now(),
-        })
+    # Teacher belongs to training only and is never a registered student module.
+    model.get_teacher()
     stream2d = ShardStream(CocoWholeBodyDataset(data_root, "train"), rank, config["workers"], config["seed"])
-    stream3d = ShardStream(ASPsetDataset(data_root, "train"), rank, config["workers"], config["seed"] + 1000003)
+    stream3d = ShardStream(Unified3DDataset(data_root, "train"), rank, config["workers"], config["seed"] + 1000003)
     ready = {
         "worker_id": rank, "phase": phase, "restored_step": checkpoint["step"],
         "runner": os.environ.get("RUNNER_NAME"), "cpu": platform.processor(),
@@ -409,11 +649,14 @@ def worker(config: dict[str, Any], work: Path, phase: int, rank: int) -> None:
                 abort_path=f"{prefix}/failures/{other_rank}.json",
             )
     step = plan["start_step"]
+    reason = "phase_budget_reached"
+    last_round_seconds = 0.0
     while step < plan["target_step"]:
+        round_started = time.monotonic()
         if rank == 0:
-            if STOP_REQUESTED or time.monotonic() > deadline - 180:
-                hub.commit({f"{prefix}/finished.json": json_bytes({"step": step, "target_step": plan["target_step"], "reason": "time_budget"})}, "Preserve checkpoint before runner deadline")
-                return
+            if STOP_REQUESTED or time.monotonic() > deadline - max(600, last_round_seconds * 1.5):
+                reason = "time_budget"
+                break
             snapshot = {
                 "step": step, "phase": phase, "run_key": run_key(),
                 "parameters": {name: parameter.detach().clone() for name, parameter in trainable_parameters(model).items()},
@@ -432,6 +675,7 @@ def worker(config: dict[str, Any], work: Path, phase: int, rank: int) -> None:
                     break
                 finished = hub.read_json(f"{prefix}/finished.json", revision=revision, optional=True)
                 if finished:
+                    acknowledge_phase(hub, prefix, rank, finished, work, plan["final_target_step"])
                     return
                 failure = hub.read_json(f"{prefix}/failures/0.json", revision=revision, optional=True)
                 if failure:
@@ -456,167 +700,55 @@ def worker(config: dict[str, Any], work: Path, phase: int, rank: int) -> None:
             atomic_write(work / "latest.pt", latest)
             # One commit contains both the complete optimizer checkpoint and its
             # progress record. An update becomes visible only after this commit.
-            hub.commit({"state/latest.pt": latest, "state/progress.json": json_bytes({
+            hub.commit({"state/latest.pt": latest,
+                        f"state/updates/{checkpoint['step']:08d}.json": json_bytes(evidence),
+                        "state/progress.json": json_bytes({
                 "step": checkpoint["step"], "run_key": run_key(), "phase": phase,
                 "checkpoint_sha256": sha256(latest), "last_update": evidence,
             })}, f"Apply both worker gradients: common AdamW step {checkpoint['step']}")
             log(work, f"worker-{phase}-{rank}", {"event": "common_update", **evidence})
+            if checkpoint["step"] % 10 == 0 or checkpoint["step"] >= plan["target_step"]:
+                publish_progress(config, work, {"stage": "parallel_finetuning", "phase": phase,
+                                                "step": checkpoint["step"], "target_step": plan["final_target_step"],
+                                                "effective_epochs2d": evidence["effective_epochs2d"],
+                                                "effective_epochs3d": evidence["effective_epochs3d"],
+                                                "contribution_counts": checkpoint["contribution_counts"],
+                                                "parallel_overlap_steps": checkpoint["parallel_overlap_steps"],
+                                                "training_batch_metrics": [packet["metrics"] for packet in packets]})
         step += 1
+        last_round_seconds = time.monotonic() - round_started
     if rank == 0:
-        hub.commit({f"{prefix}/finished.json": json_bytes({"step": step, "target_step": plan["target_step"], "reason": "target_reached"})}, f"Complete phase {phase} at step {step}")
+        finished = {"step": step, "target_step": plan["target_step"],
+                    "final_target_step": plan["final_target_step"], "reason": reason}
+        hub.commit({f"{prefix}/finished.json": json_bytes(finished)}, f"Complete phase {phase} at saved step {step}")
+        wait_json(hub, f"{prefix}/ack/1.json", time.monotonic() + min(wait_seconds, 300),
+                  abort_path=f"{prefix}/failures/1.json")
+        # Both jobs have finished all reads of round snapshots. Only temporary
+        # exchanges from this newly-created training project are compacted.
+        hub.compact_transport(prefix)
+        write_worker_status(work, step, plan["final_target_step"])
     else:
-        wait_json(hub, f"{prefix}/finished.json", min(deadline, time.monotonic() + wait_seconds), abort_path=f"{prefix}/failures/0.json")
+        finished = wait_json(hub, f"{prefix}/finished.json", min(deadline, time.monotonic() + wait_seconds), abort_path=f"{prefix}/failures/0.json")
+        acknowledge_phase(hub, prefix, rank, finished, work, plan["final_target_step"])
+
+
+def write_worker_status(work: Path, step: int, target: int) -> None:
+    result = {"step": step, "target_step": target, "remaining": step < target}
+    atomic_write(work / "status.json", json_bytes(result))
+    if os.environ.get("GITHUB_OUTPUT"):
+        with Path(os.environ["GITHUB_OUTPUT"]).open("a", encoding="utf-8") as stream:
+            stream.write(f"remaining={str(step < target).lower()}\n")
+
+
+def acknowledge_phase(hub: Hub, prefix: str, rank: int, finished: dict[str, Any], work: Path, target: int) -> None:
+    hub.commit({f"{prefix}/ack/{rank}.json": json_bytes({"step": finished["step"], "worker_id": rank})},
+               f"Worker {rank} released completed phase snapshots")
+    write_worker_status(work, finished["step"], target)
 
 
 def publish(config: dict[str, Any], work: Path) -> None:
-    from export_model import export
-    from joint_schema import COMPACT_COCO_IDS, COMPACT_JOINT_NAMES
-
-    checkpoint_hub = Hub(config["checkpoint_repo_id"])
-    revision = checkpoint_hub.head()
-    checkpoint_data = checkpoint_hub.read("state/latest.pt", revision=revision)
-    checkpoint = load_tensors(checkpoint_data)
-    manifest = checkpoint_hub.read_json(f"runs/{run_key()}/bootstrap.json", revision=revision)
-    if checkpoint["step"] <= manifest["initial_step"]:
-        raise RuntimeError("This run has not committed a new training update; the prior checkpoint is retained without a new publication")
-    if checkpoint["step"] <= 0 or checkpoint["labels2d"] <= 0 or checkpoint["labels3d"] <= 0:
-        raise RuntimeError("No learned 2D and 3D checkpoint is available to publish")
-    if any(checkpoint["contribution_counts"].get(str(rank), 0) <= 0 for rank in range(config["workers"])):
-        raise RuntimeError("The checkpoint does not contain every worker's contribution")
-    if checkpoint["parallel_overlap_steps"] <= 0:
-        raise RuntimeError("No overlapping worker computation was recorded; cannot claim parallel training")
-    if not checkpoint["resume_history"]:
-        raise RuntimeError("No actual resumed training is recorded yet")
-    data_root = work / "data"
-    prepared = checkpoint_hub.read("data/prepared.tar.gz", revision=revision)
-    if sha256(prepared) != checkpoint["data_sha256"]:
-        raise ValueError("Publication data differs from training data")
-    unpack_prepared(prepared, data_root)
-    atomic_write(work / "latest.pt", checkpoint_data)
-    ensure_images(data_root, split="val", workers=8)
-    output = work / "release"
-    metrics = export(work / "latest.pt", data_root, output)
-    training_report = {
-        "algorithm": "Synchronous mean gradients, one central AdamW update; no checkpoint weight averaging",
-        "source_repository": SOURCE_REPOSITORY, "source_sha": os.environ.get("GITHUB_SHA"),
-        "actions_run_url": f"https://github.com/{SOURCE_REPOSITORY}/actions/runs/{os.environ.get('GITHUB_RUN_ID')}",
-        "run_key": run_key(), "initial_step": manifest["initial_step"], "step": checkpoint["step"],
-        "target_step": manifest["target_step"], "target_reached": checkpoint["step"] >= manifest["target_step"],
-        "contribution_counts": checkpoint["contribution_counts"], "parallel_overlap_steps": checkpoint["parallel_overlap_steps"],
-        "joint_schema": config["joint_schema"], "learned_2d_points": len(COMPACT_COCO_IDS),
-        "learned_2d_joint_names": list(COMPACT_JOINT_NAMES),
-        "labels2d": checkpoint["labels2d"], "labels3d": checkpoint["labels3d"],
-        "resume_history": checkpoint["resume_history"], "updates": checkpoint["history"],
-        "checkpoint_repository": config["checkpoint_repo_id"], "checkpoint_revision": revision,
-        "checkpoint_sha256": sha256(checkpoint_data), "data_sha256": checkpoint["data_sha256"],
-        "resources": "Two standard ubuntu-24.04 GitHub-hosted CPU runners per training phase",
-        "limitations": "Initial research model. No accuracy threshold or end-to-end RGB-to-3D accuracy is claimed.",
-    }
-    atomic_write(output / "training_report.json", json_bytes(training_report))
-    published_data_manifest = json.loads((data_root / "dataset_manifest.json").read_text(encoding="utf-8"))
-    published_data_manifest["model_supervision"] = {
-        "schema": config["joint_schema"], "source_annotation_points": 133,
-        "learned_2d_points": len(COMPACT_COCO_IDS), "selected_coco_ids": list(COMPACT_COCO_IDS),
-        "joint_names": list(COMPACT_JOINT_NAMES),
-        "note": "The source bundle retains all annotations; only selected targets enter this model's 2D loss.",
-    }
-    atomic_write(output / "dataset_manifest.json", json_bytes(published_data_manifest))
-    for name in ("MODEL_LICENSE.md", "THIRD_PARTY.md", "data_sources.json"):
-        atomic_write(output / name, (ROOT / name).read_bytes())
-    atomic_write(output / "CODE_LICENSE", (ROOT / "LICENSE").read_bytes())
-    atomic_write(output / "LICENSE", (ROOT / "MODEL_LICENSE.md").read_bytes())
-    card = f"""---
-license: other
-license_name: wholebody-research
-license_link: MODEL_LICENSE.md
-library_name: onnx
-pipeline_tag: keypoint-detection
-tags:
-- wholebody
-- pose-estimation
-- onnx
-- research
----
-# Compact WholeBody 2D + relative body 3D
-
-An actually trained research model, generated by [GitHub Actions](https://github.com/{SOURCE_REPOSITORY}/actions).
-This publication contains {checkpoint['step']} common AdamW updates. Both workers contributed gradients to each update.
-The recorded computation intervals overlap in {checkpoint['parallel_overlap_steps']} of these updates.
-The target for this run was {manifest['target_step']} updates; target reached: {checkpoint['step'] >= manifest['target_step']}.
-
-## Download
-
-- [wholebody.onnx](https://huggingface.co/{config['hf_repo_id']}/resolve/main/wholebody.onnx)
-- [Input/output and all joint IDs](schema.json)
-- [Actual training contributions and resume records](training_report.json)
-- [Recorded validation and ONNX output differences](metrics.json)
-
-## Input and output
-
-Input `image`: float32 `[batch,3,192,144]`, RGB in [0,1], one person crop with width/height 0.75. ImageNet normalization is internal.
-Output `keypoints2d`: `[batch,73,2]`, crop-normalized x-right/y-down.
-Output `confidence2d`: `[batch,73]`, heatmap peak probability, not calibrated visibility.
-Output `body3d`: `[batch,12,3]`, meters, camera x-right/y-down/z-away, relative to the hip midpoint.
-Output `geometry2d`: `[batch,8,2]`, skeleton-derived hand reference points, hand directions and foot axes, with exact definitions in `schema.json`.
-Output `geometry_confidence`: `[batch,8]`, minimum concentration score among each geometry row's source joints, not calibrated visibility.
-The twelve 3D joints match COCO IDs 5 through 16. Absolute camera distance, global root movement, and 3D face/finger/toe joints are not outputs.
-
-## Actual training data and initial weights
-
-The original COCO-WholeBody annotation has 133 points; only 73 selected targets are learned and emitted: 12 body joints, 40 finger joints, six foot points and 15 selected face points. Wrists are shared between body and hand skeletons.
-ASPset-510 calibrated 3D joints supervise the twelve-joint lifting branch.
-The truncated backbone starts with official torchvision MobileNetV3-small ImageNet weights; the compact head and lifter are newly trained in this project. No checkpoint from the superseded 133-point model is loaded.
-The exact selected data, transformations, source URLs and image license metadata are in [dataset_manifest.json](dataset_manifest.json).
-Separate CMU Foot, AIST++ and Human3.6M datasets were not used in this run.
-
-## Inference cost and simultaneous inputs
-
-The network shares one truncated feature extractor, a 32-channel stride-8 location head with subcell offsets, and a 128-wide body lifter.
-Different camera/person crops can occupy the dynamic batch dimension in one ONNX invocation. Spatial features and predictions remain independent per crop.
-The exported `resource_usage.json` records the actual model's arithmetic and activation sizes. These counts are not a measurement of GPU utilization or device-specific latency.
-Face output includes mouth, nose tip, eye corners, eyelids and cheek-outline proxies. It does not invent pupil/gaze or cheek-surface ground truth.
-
-## Recorded results and scope
-
-2D crop-normalized mean error: {metrics['normalized_2d_error']:.6f}; PCK at 0.05 crop distance: {metrics['pck_at_0_05_crop']:.6f}.
-Lifter MPJPE from ASPset ground-truth projected 2D: {metrics['lifter_mpjpe_mm_from_ground_truth_2d']:.3f} mm.
-The latter is a lifting-only measurement, not end-to-end RGB-to-3D accuracy. These measurements do not establish production tracking quality.
-
-## License, credits and distribution
-
-Model permissions and restrictions: [MODEL_LICENSE.md](MODEL_LICENSE.md). This model is distributed for noncommercial research and education under that custom license.
-COCO-WholeBody's upstream CC BY 4.0 annotation notice and separate research/noncommercial terms both apply to the source data; ASPset-510 is CC0 1.0.
-COCO image licenses vary. Torchvision code and pretrained weight provenance are documented separately. Full authors, papers, sources and transformations: [THIRD_PARTY.md](THIRD_PARTY.md).
-New project source code retains the repository's Unlicense; this does not relicense external data or pretrained weights.
-Source distribution: https://github.com/{SOURCE_REPOSITORY}
-Model distribution: https://huggingface.co/{config['hf_repo_id']}
-"""
-    atomic_write(output / "README.md", card.encode("utf-8"))
-    public_hub = Hub(config["hf_repo_id"])
-    public_hub.create_owned(SOURCE_REPOSITORY, private=False)
-    files = {path.name: path for path in output.iterdir() if path.is_file()}
-    publication_revision = public_hub.commit(files, f"Publish learned WholeBody ONNX at common step {checkpoint['step']}")
-    # This is the requested deliverable download, not an artificial failure test.
-    anonymous = Hub(config["hf_repo_id"], token=False)
-    downloaded = anonymous.read("wholebody.onnx", revision=publication_revision)
-    expected_hash = sha256((output / "wholebody.onnx").read_bytes())
-    if sha256(downloaded) != expected_hash:
-        raise RuntimeError("Public ONNX bytes differ from the exported model")
-    result = {
-        "model_url": f"https://huggingface.co/{config['hf_repo_id']}",
-        "download_url": f"https://huggingface.co/{config['hf_repo_id']}/resolve/main/wholebody.onnx",
-        "revision": publication_revision, "onnx_sha256": expected_hash,
-        "anonymous_download_succeeded": True, "common_step": checkpoint["step"],
-        "target_reached": training_report["target_reached"], "utc": utc_now(),
-    }
-    atomic_write(work / "status.json", json_bytes(result))
-    atomic_write(output / "publication.json", json_bytes(result))
-    public_hub.commit({"publication.json": json_bytes(result)}, "Record successful public ONNX download")
-    summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
-    if summary_path:
-        with Path(summary_path).open("a", encoding="utf-8") as summary:
-            summary.write(f"## Learned WholeBody model\n\n[Download ONNX]({result['download_url']})\n\nCommon step: {checkpoint['step']}; overlapping updates: {checkpoint['parallel_overlap_steps']}; actual resume records: {len(checkpoint['resume_history'])}.\n")
-    log(work, "publish", {"event": "published", **result})
+    from publication import publish_learned
+    publish_learned(config, work)
 
 
 def main() -> None:
@@ -624,7 +756,7 @@ def main() -> None:
     parser.add_argument("command", choices=("bootstrap", "worker", "publish"))
     parser.add_argument("--config", type=Path, default=Path("train_config.json"))
     parser.add_argument("--work-dir", type=Path, default=Path("work"))
-    parser.add_argument("--phase", type=int, choices=(1, 2), default=1)
+    parser.add_argument("--phase", type=int, choices=range(1, 13), default=1)
     parser.add_argument("--rank", type=int, choices=(0, 1), default=0)
     args = parser.parse_args()
     config = load_config(args.config)

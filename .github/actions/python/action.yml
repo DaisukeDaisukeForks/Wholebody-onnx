@@ -1,0 +1,14 @@
+name: Python CPU learning dependencies
+description: Install the pinned runtime used by actual training and export
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+        cache: pip
+        cache-dependency-path: requirements.txt
+    - shell: bash
+      run: |
+        python -m pip install --disable-pip-version-check torch==2.9.0 --index-url https://download.pytorch.org/whl/cpu
+        python -m pip install --disable-pip-version-check -r requirements.txt

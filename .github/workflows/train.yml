@@ -1,4 +1,4 @@
-name: Train and publish WholeBody ONNX
+name: Learn and publish Pose73 ONNX
 
 on:
   push:
@@ -8,10 +8,11 @@ on:
       - 'requirements.txt'
       - 'train_config.json'
       - 'data_sources.json'
-      - 'MODEL_CARD.md'
       - 'MODEL_LICENSE.md'
       - 'THIRD_PARTY.md'
-      - '.github/workflows/train.yml'
+      - 'LICENSES/**'
+      - '.github/workflows/**'
+      - '.github/actions/**'
   workflow_dispatch:
 
 permissions:
@@ -19,7 +20,7 @@ permissions:
 
 concurrency:
   group: wholebody-${{ github.repository }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 env:
   HF_TOKEN: ${{ secrets.HF_TOKEN }}
@@ -30,33 +31,18 @@ env:
   HF_HUB_DISABLE_PROGRESS_BARS: '1'
 
 jobs:
-  redesign:
-    name: Pause training for the accuracy redesign
-    runs-on: ubuntu-24.04
-    steps:
-      - run: echo 'Training is paused while pose initialization, learning duration, 3D supervision, and publication quality criteria are revised.'
-
   bootstrap:
-    name: Create Hugging Face repositories and restore training state
-    if: ${{ false }}
+    name: Prepare real data, pose initialization and 3D warmup
     runs-on: ubuntu-24.04
-    timeout-minutes: 120
+    timeout-minutes: 360
     steps:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-          cache: pip
-          cache-dependency-path: requirements.txt
-      - name: Install CPU training dependencies
-        run: |
-          python -m pip install --disable-pip-version-check torch==2.9.0 torchvision==0.24.0 --index-url https://download.pytorch.org/whl/cpu
-          python -m pip install --disable-pip-version-check -r requirements.txt
-      - name: Initialize or resume the shared model
+      - uses: ./.github/actions/python
+      - name: Create new HF repositories and learn the 3D initialization
         run: python train.py bootstrap --config train_config.json --work-dir work
-      - name: Preserve bootstrap logs
+      - name: Preserve preparation and learning logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -68,100 +54,141 @@ jobs:
             work/status.json
 
   phase1:
-    name: Phase 1 / worker ${{ matrix.rank }}
-    needs: bootstrap
-    runs-on: ubuntu-24.04
-    timeout-minutes: 360
-    strategy:
-      fail-fast: false
-      max-parallel: 2
-      matrix:
-        rank: [0, 1]
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          persist-credentials: false
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-          cache: pip
-          cache-dependency-path: requirements.txt
-      - name: Install CPU training dependencies
-        run: |
-          python -m pip install --disable-pip-version-check torch==2.9.0 torchvision==0.24.0 --index-url https://download.pytorch.org/whl/cpu
-          python -m pip install --disable-pip-version-check -r requirements.txt
-      - name: Train the common model on a real data shard
-        run: python train.py worker --config train_config.json --work-dir work --phase 1 --rank ${{ matrix.rank }}
-      - name: Preserve worker logs
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: phase1-worker${{ matrix.rank }}-${{ github.run_id }}-${{ github.run_attempt }}
-          retention-days: 7
-          if-no-files-found: ignore
-          path: |
-            work/logs/
-            work/status.json
+    name: Shared learning phase 1
+    needs: [bootstrap]
+    if: ${{ always() && !cancelled() && needs.bootstrap.result == 'success' }}
+    uses: ./.github/workflows/phase.yml
+    with:
+      phase: 1
+    secrets:
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
 
   phase2:
-    name: Phase 2 / worker ${{ matrix.rank }}
+    name: Shared learning phase 2
     needs: [bootstrap, phase1]
-    if: ${{ always() && needs.bootstrap.result == 'success' && !cancelled() }}
-    runs-on: ubuntu-24.04
-    timeout-minutes: 360
-    strategy:
-      fail-fast: false
-      max-parallel: 2
-      matrix:
-        rank: [0, 1]
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          persist-credentials: false
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-          cache: pip
-          cache-dependency-path: requirements.txt
-      - name: Install CPU training dependencies
-        run: |
-          python -m pip install --disable-pip-version-check torch==2.9.0 torchvision==0.24.0 --index-url https://download.pytorch.org/whl/cpu
-          python -m pip install --disable-pip-version-check -r requirements.txt
-      - name: Continue from the durable optimizer checkpoint
-        run: python train.py worker --config train_config.json --work-dir work --phase 2 --rank ${{ matrix.rank }}
-      - name: Preserve worker logs
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: phase2-worker${{ matrix.rank }}-${{ github.run_id }}-${{ github.run_attempt }}
-          retention-days: 7
-          if-no-files-found: ignore
-          path: |
-            work/logs/
-            work/status.json
+    if: ${{ always() && !cancelled() && needs.bootstrap.result == 'success' && needs.phase1.result != 'skipped' && needs.phase1.outputs.remaining != 'false' }}
+    uses: ./.github/workflows/phase.yml
+    with:
+      phase: 2
+    secrets:
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+
+  phase3:
+    name: Shared learning phase 3
+    needs: [bootstrap, phase2]
+    if: ${{ always() && !cancelled() && needs.bootstrap.result == 'success' && needs.phase2.result != 'skipped' && needs.phase2.outputs.remaining != 'false' }}
+    uses: ./.github/workflows/phase.yml
+    with:
+      phase: 3
+    secrets:
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+
+  phase4:
+    name: Shared learning phase 4
+    needs: [bootstrap, phase3]
+    if: ${{ always() && !cancelled() && needs.bootstrap.result == 'success' && needs.phase3.result != 'skipped' && needs.phase3.outputs.remaining != 'false' }}
+    uses: ./.github/workflows/phase.yml
+    with:
+      phase: 4
+    secrets:
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+
+  phase5:
+    name: Shared learning phase 5
+    needs: [bootstrap, phase4]
+    if: ${{ always() && !cancelled() && needs.bootstrap.result == 'success' && needs.phase4.result != 'skipped' && needs.phase4.outputs.remaining != 'false' }}
+    uses: ./.github/workflows/phase.yml
+    with:
+      phase: 5
+    secrets:
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+
+  phase6:
+    name: Shared learning phase 6
+    needs: [bootstrap, phase5]
+    if: ${{ always() && !cancelled() && needs.bootstrap.result == 'success' && needs.phase5.result != 'skipped' && needs.phase5.outputs.remaining != 'false' }}
+    uses: ./.github/workflows/phase.yml
+    with:
+      phase: 6
+    secrets:
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+
+  phase7:
+    name: Shared learning phase 7
+    needs: [bootstrap, phase6]
+    if: ${{ always() && !cancelled() && needs.bootstrap.result == 'success' && needs.phase6.result != 'skipped' && needs.phase6.outputs.remaining != 'false' }}
+    uses: ./.github/workflows/phase.yml
+    with:
+      phase: 7
+    secrets:
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+
+  phase8:
+    name: Shared learning phase 8
+    needs: [bootstrap, phase7]
+    if: ${{ always() && !cancelled() && needs.bootstrap.result == 'success' && needs.phase7.result != 'skipped' && needs.phase7.outputs.remaining != 'false' }}
+    uses: ./.github/workflows/phase.yml
+    with:
+      phase: 8
+    secrets:
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+
+  phase9:
+    name: Shared learning phase 9
+    needs: [bootstrap, phase8]
+    if: ${{ always() && !cancelled() && needs.bootstrap.result == 'success' && needs.phase8.result != 'skipped' && needs.phase8.outputs.remaining != 'false' }}
+    uses: ./.github/workflows/phase.yml
+    with:
+      phase: 9
+    secrets:
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+
+  phase10:
+    name: Shared learning phase 10
+    needs: [bootstrap, phase9]
+    if: ${{ always() && !cancelled() && needs.bootstrap.result == 'success' && needs.phase9.result != 'skipped' && needs.phase9.outputs.remaining != 'false' }}
+    uses: ./.github/workflows/phase.yml
+    with:
+      phase: 10
+    secrets:
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+
+  phase11:
+    name: Shared learning phase 11
+    needs: [bootstrap, phase10]
+    if: ${{ always() && !cancelled() && needs.bootstrap.result == 'success' && needs.phase10.result != 'skipped' && needs.phase10.outputs.remaining != 'false' }}
+    uses: ./.github/workflows/phase.yml
+    with:
+      phase: 11
+    secrets:
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+
+  phase12:
+    name: Shared learning phase 12
+    needs: [bootstrap, phase11]
+    if: ${{ always() && !cancelled() && needs.bootstrap.result == 'success' && needs.phase11.result != 'skipped' && needs.phase11.outputs.remaining != 'false' }}
+    uses: ./.github/workflows/phase.yml
+    with:
+      phase: 12
+    secrets:
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
 
   publish:
-    name: Export learned ONNX and publish with licenses
-    needs: [bootstrap, phase1, phase2]
-    if: ${{ always() && needs.bootstrap.result == 'success' && !cancelled() }}
+    name: Evaluate real accuracy, export and publish qualified ONNX
+    needs: [bootstrap, phase12]
+    if: ${{ always() && !cancelled() && needs.bootstrap.result == 'success' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-          cache: pip
-          cache-dependency-path: requirements.txt
-      - name: Install CPU training and ONNX dependencies
-        run: |
-          python -m pip install --disable-pip-version-check torch==2.9.0 torchvision==0.24.0 --index-url https://download.pytorch.org/whl/cpu
-          python -m pip install --disable-pip-version-check -r requirements.txt
-      - name: Export and publish the learned model
+      - uses: ./.github/actions/python
+      - name: Install the real held-out video decoder
+        run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends ffmpeg
+      - name: Evaluate the learned checkpoint and apply publication criteria
         run: python train.py publish --config train_config.json --work-dir work
-      - name: Preserve publication information
+      - name: Preserve measured evaluation and publication information
         if: always()
         uses: actions/upload-artifact@v4
         with:

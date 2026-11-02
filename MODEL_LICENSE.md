@@ -1,20 +1,35 @@
-# WholeBody Research Model License 1.0
+# WholeBody Pose73 Model Release Terms 1.1
 
 Copyright 2026 DaisukeDaisuke, for the publisher's own contributions.
 
-## Scope and permission
+## Upstream parameters and adapted implementation
 
-This license applies to the trained checkpoint parameters and ONNX model files produced by this project. To the extent the publisher holds the necessary rights, permission is granted to download, use, study, reproduce, adapt, and redistribute these model files for noncommercial research and educational purposes, subject to retaining this license, `THIRD_PARTY.md`, and source attribution. Redistributed adaptations must state the changes and preserve these conditions for the publisher's licensed contributions. No endorsement by a dataset author, institution, or upstream software project is implied.
+The pose initializer is the official DWPose-t / RTMPose-t WholeBody model. DWPose's [author model card](https://huggingface.co/yzd-v/DWPose/blob/main/README.md) identifies Apache-2.0. The adapted CSPNeXt/RTMCC implementation and upstream pretrained material retain their Apache-2.0 terms, copyright notices, and permissions.
 
-## Third-party material
+The full license is in [LICENSES/Apache-2.0.txt](LICENSES/Apache-2.0.txt), with attribution and project modifications in [LICENSES/DWPose-NOTICE.txt](LICENSES/DWPose-NOTICE.txt). This document does not withdraw or narrow rights already granted by those upstream licensors.
 
-The configured compact model uses 73 selected COCO-WholeBody 2D labels and 12 matching ASPset-510 3D body-joint labels, with a truncated Torchvision MobileNetV3 Small ImageNet initializer as recorded in the training manifest. The point count describes the current selection, not a permanent requirement. [THIRD_PARTY.md](THIRD_PARTY.md) gives the sources, distribution locations, license links, and transformations; the published run records actual training. COCO-WholeBody's official page specifies research/noncommercial dataset use while identifying its annotations as CC BY 4.0. ASPset-510 is CC0. COCO images retain their individual image conditions. Torchvision distinguishes its BSD software license from potentially separate pretrained-model conditions.
-This document licenses only rights the publisher can grant. It does not relicense upstream datasets, images, or pretrained parameters, resolve the legal treatment of learned weights in every jurisdiction, or assert that a dataset license automatically becomes a copyright license for all resulting parameters. In particular, this release does not grant commercial-use rights. Any rights needed beyond this release must be obtained from the applicable rights holders.
+## Additional grant for publisher-owned contributions
+
+To the extent the publisher holds the necessary rights in newly trained contributions and added model components, permission is granted to download, use, study, reproduce, adapt, and redistribute those contributions for noncommercial research and educational purposes. Retain this document, `THIRD_PARTY.md`, the applicable files in `LICENSES/`, and source attribution. State modifications in redistributed adaptations and preserve these conditions for the publisher's licensed contributions.
+
+This additional grant does not replace upstream Apache-2.0, the H3WB annotation MIT license, or any dataset's own conditions. It supplies no additional commercial-use permission for publisher-owned fine-tuning contributions. No endorsement by upstream authors or institutions is implied.
+
+## Training data and scope
+
+The configured model selects 73 COCO-WholeBody 2D landmarks, uses paired H3WB annotations to supervise their 3D coordinates, and adds ASPset-510 supervision for the 12 matching body joints. Invalid or unavailable labels are masked. The input and output definitions, actual training sources, and preprocessing are recorded in the published schema and manifest.
+
+[THIRD_PARTY.md](THIRD_PARTY.md) lists source owners, distribution URLs, credits, transformations, and conditions. COCO-WholeBody identifies its annotations as CC BY 4.0 and separately specifies research/noncommercial dataset use. COCO images retain individual conditions. ASPset-510 is CC0. H3WB annotations carry the [MIT license](LICENSES/H3WB-MIT.txt); Human3.6M image conditions are separate, and this pipeline does not acquire those RGB images.
+
+These statements do not assert that every dataset license automatically becomes a copyright license for all resulting parameters. The publisher grants only its own rights and does not relicense upstream data, images, or parameters.
 
 ## Source code and distribution
 
-The project's training and export source code preserves the existing Unlicense in the separate root `LICENSE` of [DaisukeDaisuke/Wholebody-onnx](https://github.com/DaisukeDaisuke/Wholebody-onnx). Its source-code license does not change these model conditions. The intended public model destination is [RabbitDaisuke/Wholebody-Compact-20261102-a6fde3](https://huggingface.co/RabbitDaisuke/Wholebody-Compact-20261102-a6fde3), with private training state in the separately created `RabbitDaisuke/Wholebody-Compact-20261102-a6fde3-checkpoints` repository. The configured destination is not a claim of completed publication; the generated model card records the actual published revision.
+The project's original code preserves the source repository's [Unlicense](https://github.com/DaisukeDaisuke/Wholebody-onnx/blob/main/LICENSE), also included as `CODE_LICENSE` in model distributions. Apache-covered adaptations are separately identified and are not placed under that public-domain dedication.
+
+Development source: [DaisukeDaisuke/Wholebody-onnx](https://github.com/DaisukeDaisuke/Wholebody-onnx). Intended public model: [RabbitDaisuke/Wholebody-Pose73-20261102-a6fde3](https://huggingface.co/RabbitDaisuke/Wholebody-Pose73-20261102-a6fde3). Private training state: [RabbitDaisuke/Wholebody-Pose73-20261102-a6fde3-checkpoints](https://huggingface.co/RabbitDaisuke/Wholebody-Pose73-20261102-a6fde3-checkpoints).
+
+GitHub Actions creates the new destinations. Their names are not evidence of completed training. Publication records identify the actual model revision, quality-gate result, and training provenance. Distributions must include the applicable license and attribution files.
 
 ## Warranty
 
-The publisher provides the model as available, without a warranty of accuracy, fitness, or noninfringement, and disclaims liability to the extent permitted by applicable law. Published metrics describe the stated run and evaluation data only.
+Publisher-owned contributions are provided as available, without warranties of accuracy, fitness, or noninfringement, and without liability to the extent permitted by applicable law. Upstream warranty and liability clauses remain in effect for their covered material. Reported metrics apply only to the stated model, data, and evaluation input conditions; they are not guarantees of production GPU usage or unseen-scene accuracy.

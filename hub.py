@@ -13,7 +13,7 @@ from typing import Any
 
 import requests
 import torch
-from huggingface_hub import CommitOperationAdd, HfApi, hf_hub_url
+from huggingface_hub import CommitOperationAdd, CommitOperationDelete, HfApi, hf_hub_url
 from huggingface_hub.errors import HfHubHTTPError, RepositoryNotFoundError
 
 
@@ -91,7 +91,7 @@ class Hub:
         data = self.read(path, revision, optional)
         return None if data is None else json.loads(data.decode("utf-8"))
 
-    def commit(self, files: dict[str, bytes | Path], message: str) -> str:
+    def commit(self, files: dict[str, bytes | Path], message: str, *, delete_files: list[str] | None = None) -> str:
         """Atomically publish related files; retry only concurrent-head conflicts.
 
         Writers use distinct paths. The coordinator alone owns state/latest.pt.
@@ -103,6 +103,8 @@ class Hub:
                 CommitOperationAdd(path_in_repo=name, path_or_fileobj=value if isinstance(value, bytes) else str(value))
                 for name, value in files.items()
             ]
+            operations.extend(CommitOperationDelete(path_in_repo=name, is_folder=False)
+                              for name in (delete_files or []))
             try:
                 result = self.api.create_commit(
                     self.repo_id, operations=operations, commit_message=message,
@@ -121,7 +123,7 @@ class Hub:
         if not self.repo_id.startswith("RabbitDaisuke/"):
             raise ValueError("The requested publication namespace is RabbitDaisuke")
         marker_path = "project.json"
-        expected = {"format": 1, "source_repository": source_repo, "project": "wholebody-compact-a6fde3"}
+        expected = {"format": 1, "source_repository": source_repo, "project": "wholebody-pose73-a6fde3"}
         try:
             info = self.api.repo_info(self.repo_id, repo_type="model")
         except RepositoryNotFoundError:
@@ -129,10 +131,47 @@ class Hub:
             self.commit({marker_path: json_bytes(expected)}, "Initialize new WholeBody training project")
             return
         marker = self.read_json(marker_path, revision=info.sha, optional=True)
+        allowed_new_repositories = {
+            "RabbitDaisuke/Wholebody-Pose73-20261102-a6fde3",
+            "RabbitDaisuke/Wholebody-Pose73-20261102-a6fde3-checkpoints",
+        }
+        if marker is None and self.repo_id in allowed_new_repositories and bool(info.private) == private:
+            files = self.api.list_repo_files(self.repo_id, repo_type="model", revision=info.sha)
+            if set(files) <= {".gitattributes"}:
+                self.commit({marker_path: json_bytes(expected)}, "Finish this task's interrupted empty-repository initialization")
+                return
         if marker != expected:
             raise RuntimeError(f"{self.repo_id} already exists and is not this project; refusing to reuse it")
         if bool(info.private) != private:
             raise RuntimeError(f"Unexpected visibility for {self.repo_id}; refusing to change it implicitly")
+
+    def compact_transport(self, phase_prefix: str) -> None:
+        """Retain durable model/optimizer state, discard acknowledged exchanges.
+
+        Applies only to the new task-owned private transport repository. Latest,
+        previous-phase and initial checkpoints plus all update evidence remain.
+        The caller has received peer acknowledgement before removing revisions.
+        """
+        if self.repo_id != "RabbitDaisuke/Wholebody-Pose73-20261102-a6fde3-checkpoints":
+            raise ValueError("Transport cleanup is restricted to this new private training repository")
+        info = self.api.repo_info(self.repo_id, repo_type="model")
+        marker = self.read_json("project.json", revision=info.sha)
+        if not info.private or marker.get("project") != "wholebody-pose73-a6fde3":
+            raise RuntimeError("Unexpected repository ownership during transport cleanup")
+        if not phase_prefix.startswith("runs/") or "/phase" not in phase_prefix or ".." in phase_prefix:
+            raise ValueError("Invalid completed phase prefix")
+        files = self.api.list_repo_files(self.repo_id, repo_type="model", revision=info.sha)
+        # Sequential workflow phases guarantee older phases have also stopped.
+        # Include abandoned exchanges from recovered phases, so a previous
+        # failure cannot grow the retained repository indefinitely.
+        temporary = [name for name in files if name.startswith("runs/")
+                     and "/phase" in name and ("/weights/" in name or "/gradients/" in name)]
+        if temporary:
+            self.commit({}, "Remove acknowledged round exchanges; retain complete training state", delete_files=temporary)
+        self.api.super_squash_history(
+            self.repo_id, repo_type="model", branch="main",
+            commit_message="Compact temporary transport history; retain initial, previous and latest optimizer checkpoints",
+        )
 
 
 def wait_json(hub: Hub, path: str, deadline: float, *, abort_path: str | None = None) -> Any:

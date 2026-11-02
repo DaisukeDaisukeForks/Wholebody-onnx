@@ -1,0 +1,55 @@
+name: Parallel Pose73 learning phase
+
+on:
+  workflow_call:
+    inputs:
+      phase:
+        required: true
+        type: number
+    secrets:
+      HF_TOKEN:
+        required: true
+    outputs:
+      remaining:
+        value: ${{ jobs.train.outputs.remaining }}
+
+permissions:
+  contents: read
+
+jobs:
+  train:
+    name: Phase ${{ inputs.phase }} / worker ${{ matrix.rank }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        rank: [0, 1]
+    outputs:
+      remaining: ${{ steps.learn.outputs.remaining }}
+    env:
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      RUN_KEY: ${{ github.run_id }}-${{ github.run_attempt }}
+      OMP_NUM_THREADS: '4'
+      MKL_NUM_THREADS: '4'
+      PYTHONUNBUFFERED: '1'
+      HF_HUB_DISABLE_PROGRESS_BARS: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/python
+      - name: Apply both workers to the shared optimizer state
+        id: learn
+        run: python train.py worker --config train_config.json --work-dir work --phase ${{ inputs.phase }} --rank ${{ matrix.rank }}
+      - name: Preserve actual worker contribution logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: phase${{ inputs.phase }}-worker${{ matrix.rank }}-${{ github.run_id }}-${{ github.run_attempt }}
+          retention-days: 7
+          if-no-files-found: ignore
+          path: |
+            work/logs/
+            work/status.json

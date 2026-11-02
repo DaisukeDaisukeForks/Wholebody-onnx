@@ -1,7 +1,8 @@
 """Shared anatomical mapping for the compact 73-landmark training targets.
 
-All learned 2D points map to real COCO-WholeBody labels. Derived references are
-geometric definitions, not extra supervised surfaces or unobserved 3D normals.
+All learned points map to COCO-WholeBody/H3WB labels. H3WB supplies all 73
+camera-space 3D targets; ASPset supplies only the 12 common body targets.
+Derived references are geometric definitions, not separately labeled surfaces.
 """
 
 BODY_3D_COCO_IDS = list(range(5, 17))
@@ -83,7 +84,7 @@ def _direction(name, start_ids, end_ids, meaning):
         "name": name, "operation": "mean(end)-mean(start)",
         "start_joint_ids": start_ids, "end_joint_ids": end_ids,
         "required_visible_joint_ids": list(dict.fromkeys(start_ids + end_ids)),
-        "coordinate_scale_after_subtraction": [144 / 192, 1.0],
+        "coordinate_scale_after_subtraction": [192 / 256, 1.0],
         "coordinate_system": "isotropic 2D crop plane, x right and y down",
         "unit": "crop height; vector is not unit normalized",
         "minimum_vector_length": 1e-6,
@@ -156,23 +157,50 @@ GEOMETRY2D_SCHEMA = {
          "operation": "weighted sum of the selected keypoints, then coordinate scaling",
          "source_compact_ids": ids, "weights": weights,
          "required_visible_joint_ids": ids,
-         "coordinate_scale": [1.0, 1.0] if index < 2 else [144 / 192, 1.0],
+         "coordinate_scale": [1.0, 1.0] if index < 2 else [192 / 256, 1.0],
          "meaning": "crop-normalized hand reference point" if index < 2 else "raw 2D vector in crop-height units, not unit normalized"}
         for index, (ids, weights) in enumerate(_GEOMETRY_TERMS)
     ],
-    "confidence": "Minimum source landmark spatial-softmax peak concentration. This is not calibrated visibility or a learned surface-classification score.",
+    "confidence": "Minimum source landmark confidence from the pose model. This is not calibrated visibility, a 3D error estimate or a learned surface-classification score.",
     "ground_truth_validity": "All listed source landmarks must have valid 2D labels; absent labels never create a default reference.",
     "direction_validity": "Rows 2 through 7 define an orientation only when their vector norm exceeds 1e-6; a zero vector has no angle even if source confidence is nonzero.",
     "hand_back_reference": "Rows 0 and 1 use the wrist and four non-thumb MCP landmarks. They provide skeleton-based palm/hand-back reference positions, not separately labeled hand-back surface centers.",
     "sole_reference": "Rows 4 through 7 are image-plane foot axes. They do not predict a 3D sole normal or sole surface.",
 }
 
+GEOMETRY3D_NAMES = [
+    "left_hand_reference_3d", "right_hand_reference_3d",
+    "left_hand_forward_3d", "right_hand_forward_3d",
+    "left_foot_forward_3d", "right_foot_forward_3d",
+    "left_toe_span_3d", "right_toe_span_3d",
+]
+GEOMETRY3D_WEIGHTS = [row.copy() for row in GEOMETRY2D_WEIGHTS]
+GEOMETRY3D_SCHEMA = {
+    "output_name": "geometry3d", "shape": ["batch", 8, 3],
+    "names": GEOMETRY3D_NAMES, "unit": "meter",
+    "coordinates": "camera x right, y down, z away; hip-relative positions and relative vectors",
+    "rows": [
+        {"id": index, "name": GEOMETRY3D_NAMES[index],
+         "operation": "weighted sum of selected 3D landmarks",
+         "source_compact_ids": ids, "weights": weights,
+         "required_valid_3d_joint_ids": ids,
+         "meaning": "hip-relative hand reference position" if index < 2 else "raw 3D vector in meters, not unit normalized"}
+        for index, (ids, weights) in enumerate(_GEOMETRY_TERMS)
+    ],
+    "ground_truth_validity": "All listed source landmarks must have valid 3D labels. H3WB provides these labels; the body-only ASPset cache does not supervise these hand/foot references.",
+    "direction_validity": "Rows 2 through 7 define an orientation only for vector norms above 1e-6 meters.",
+    "confidence": "Input-landmark confidence does not establish 3D accuracy; no calibrated 3D uncertainty or surface-class score is implied.",
+    "hand_back_reference": "Wrist/finger-joint geometry supplies a 3D tracking reference, not a separately annotated dorsal skin point or surface normal.",
+    "sole_reference": "Heel/toe geometry supplies 3D foot axes. It does not measure a sole surface, contact state or sole normal.",
+}
+
 JOINT_SCHEMA = {
-    "schema_id": "compact73-coco-wholebody-v1",
-    "version": 1,
+    "schema_id": "compact73-coco-h3wb-v2",
+    "version": 2,
     "learned_2d_point_count": len(COMPACT_COCO_IDS),
+    "learned_3d_point_count": len(COMPACT_COCO_IDS),
     "source_annotation_point_count": 133,
-    "source": "COCO-WholeBody v1.0",
+    "source": "COCO-WholeBody v1.0 2D and H3WB 3D; ASPset common body12",
     "source_ids": COMPACT_COCO_IDS,
     "joint_names": COMPACT_JOINT_NAMES,
     "groups": GROUPS,
@@ -187,6 +215,23 @@ JOINT_SCHEMA = {
         "joint_names": BODY_3D_NAMES, "unit": "meter",
         "coordinates": "camera x right, y down, z away",
         "root": "midpoint of compact joints 6 and 7 (left_hip and right_hip)",
+        "role": "Body subset shared with ASPset; the full exported 3D pose has 73 points.",
+    },
+    "pose3d": {
+        "output_name": "keypoints3d", "shape": ["batch", 73, 3],
+        "compact_ids": list(range(73)), "source_coco_ids": COMPACT_COCO_IDS,
+        "joint_names": COMPACT_JOINT_NAMES, "unit": "meter",
+        "coordinates": "camera x right, y down, z away",
+        "root": "midpoint of compact joints 6 and 7 (left_hip and right_hip)",
+        "h3wb_supervision": "Actual author-released 73 selected multiview reconstructed/completed 3D labels, converted from millimeters to meters.",
+        "aspset_supervision": "Only compact0..11 body labels; all other valid3d entries are zero.",
+        "input_mask_vs_target_mask": "valid2d describes available 2D inputs; valid3d describes available source 3D labels. Input corruption/dropout does not remove otherwise valid 3D supervision.",
+    },
+    "input_crop": {
+        "height": 256, "width": 192, "aspect": 0.75, "expansion": 1.25,
+        "image": "RGB float32 in [0,1] before model preprocessing",
+        "xy": "Crop-normalized [0,1] coordinates with a separate validity/confidence channel.",
+        "normalization": "The model applies aspect correction and confidence-aware body-root/scale normalization identically at training and inference.",
     },
     "skeleton_edges": SKELETON_EDGES,
     "skeleton_edge_visibility": "Both endpoint labels must be valid; omitted intermediate face landmarks are not synthesized.",
@@ -196,8 +241,10 @@ JOINT_SCHEMA = {
     },
     "derived_references": DERIVED_REFERENCES,
     "geometry2d": GEOMETRY2D_SCHEMA,
+    "geometry3d": GEOMETRY3D_SCHEMA,
     "derived_visibility": {
-        "ground_truth": "All required visible joint IDs must have source visibility > 0 and remain inside the crop.",
+        "ground_truth_2d": "All required visible joint IDs must have source visibility > 0 and remain inside the crop.",
+        "ground_truth_3d": "All required 3D joint IDs must have valid3d > 0; availability is source-specific and separate from input masking.",
         "inference": "Require all relevant predicted landmarks to pass the caller's confidence criterion; model peak probability is not calibrated visibility.",
         "unavailable": "A missing required point or a direction shorter than minimum_vector_length makes the reference unavailable. No default direction is substituted.",
     },
@@ -209,6 +256,6 @@ JOINT_SCHEMA = {
     },
     "hand_and_foot_semantics": {
         "hand_back": "Hand-back tracking uses the skeleton-derived hand reference. There is no separately supervised dorsal surface point, palm/back classifier, or hand surface normal.",
-        "feet": "Learned foot labels are two toe landmarks and a heel per foot. Directions are 2D geometric references; no sole-surface or 3D sole-normal labels are claimed.",
+        "feet": "Learned foot labels are two toe landmarks and a heel per foot in 2D and 3D. Heel/toe axes are derived geometric references; no sole-surface, contact or sole-normal labels are claimed.",
     },
 }

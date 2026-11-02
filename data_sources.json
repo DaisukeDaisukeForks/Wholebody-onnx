@@ -12,7 +12,8 @@
     "image_terms": "https://cocodataset.org/#termsofuse",
     "authors": "Sheng Jin, Lumin Xu, Jin Xu, Can Wang, Wentao Liu, Chen Qian, Wanli Ouyang and Ping Luo; annotations owned by SenseTime Research",
     "citation": "Jin et al. Whole-Body Human Pose Estimation in the Wild. ECCV 2020.",
-    "modifications": "Keep the source's 133-label annotation indexing in prepared metadata, then select only the 73 declared body, finger, foot and face targets for model supervision. Person crops, resizing, coordinate normalization and invalid annotation exclusion. No duplicate hand-root outputs. Per-image license IDs and original source URLs are retained in dataset_manifest.json."
+    "modifications": "Keep the source's 133-label annotation indexing in prepared metadata, then select only the 73 declared body, finger, foot and face targets for model supervision. Person boxes are expanded by1.25 at width/height aspect0.75 and resized to256x192 RGB. Invalid annotations are excluded from2D loss. No duplicate hand-root outputs. Per-image license IDs and original source URLs are retained in dataset_manifest.json.",
+    "residual_calibration": "CocoCalibrationDataset selects labeled crops only from COCOtrain using a deterministic hash. The deployed pose student's measured residuals inform3D input corruption. Validation and test examples are not used to fit the residual bank."
   },
   "aspset510": {
     "name": "ASPset-510 v1",
@@ -27,8 +28,56 @@
       {"url": "https://archive.org/download/aspset510/aspset510_v1_trainval-cameras.tar.gz", "md5": "1dca82253524fa6f379616851c8e9356"},
       {"url": "https://archive.org/download/aspset510/aspset510_v1_trainval-joints_3d.tar.gz", "md5": "f848dc688c3d8536063515fff5349b98"}
     ],
-    "modifications": "Select the 12 anatomical joints shared with COCO5..16; calibrated camera projection; camera-axis normalization; hip-midpoint subtraction; meters; frame subsampling. No ASPset RGB video required.",
+    "modifications": "Select the 12 anatomical joints shared with COCO5..16; calibrated camera projection; camera-axis normalization; hip-midpoint subtraction; meters; frame subsampling. Expose these body12 labels in the shared73-point interface with all other2D/3D availability masks zero. Projected body bounding boxes use aspect0.75 and expansion1.25. No ASPset RGB video required.",
     "implementation_reference": "https://github.com/anibali/aspset-510/blob/master/src/aspset510/torch/__init__.py"
   },
-  "not_separately_downloaded": ["CMU Human Foot Keypoint Dataset", "AIST++", "Human3.6M"]
+  "h3wb": {
+    "name": "H3WB: Human3.6M 3D WholeBody annotations",
+    "source": "https://github.com/wholebody3d/wholebody3d",
+    "distribution": "https://drive.google.com/file/d/1LZh4Jsg3_ZKBF0iEPiexzoGHE4srLgfC/view",
+    "google_drive_file_id": "1LZh4Jsg3_ZKBF0iEPiexzoGHE4srLgfC",
+    "source_sha256": "d423224a9e3c47aa8320687a8fcb58e732aa8d3aabe589e01ce390030d123b1d",
+    "source_bytes": 245805345,
+    "format": "Inspected official NPZ contains only train_data and metadata object dictionaries, with no bbox dictionary. SHA256 is verified before object-array loading. Prepared worker NPZ files contain only numeric/string arrays and require no pickle.",
+    "license": "MIT (3D annotations)",
+    "license_url": "https://github.com/wholebody3d/wholebody3d/blob/main/LICENSE.md",
+    "copyright": "Copyright (c) 2022 H3WB 3D WholeBody Dataset Annotations",
+    "authors": "Yue Zhu, Nermin Samet and David Picard",
+    "citation": "Zhu, Samet and Picard. H3WB: Human3.6M 3D WholeBody Dataset and Benchmark. ICCV2023, pages20166-20177.",
+    "paper": "https://openaccess.thecvf.com/content/ICCV2023/html/Zhu_H3WB_Human3.6M_3D_WholeBody_Dataset_and_Benchmark_ICCV_2023_paper.html",
+    "split": {"train_subjects": ["S1", "S5", "S6"], "validation_subjects": ["S7"], "unused_test_subjects": ["S8"]},
+    "units": "Raw camera_3d is in millimeters; divide by1000 and subtract the midpoint of COCOhips11/12 to obtain camera-space hip-relative meters.",
+    "label_provenance": "Author-released multiview reconstructed/completed whole-body3D labels. This is dataset supervision, not independently measured optical-marker ground truth for every finger or face landmark.",
+    "source_camera_frame_counts": {"S1": 20000, "S5": 20000, "S6": 20000, "S7": 20000},
+    "bbox_source": "The extent of all133 finite source2D landmarks, then aspect0.75 and expansion1.25. The official annotation-only NPZ does not include bounding boxes.",
+    "modifications": "Select the same compact73 anatomical labels used for2D. Transform source pixel pose_2d using its full133-point extent bbox and the common aspect/expansion rule. Preserve subject/action/camera and zero-padded source frame strings, separate2D/3D availability masks, sourceSHA256 and actual accepted sample counts. A subject and every camera view of its actions remain in one split.",
+    "image_license": "Human3.6M RGB images have separate terms; the MIT annotation license does not cover them. This data preparation downloads and distributes no Human3.6M images.",
+    "image_terms": "http://vision.imar.ro/human3.6m/eula.php",
+    "implementation_reference": "https://github.com/open-mmlab/mmpose/blob/main/mmpose/datasets/datasets/wholebody3d/h3wb_dataset.py",
+    "official_preparation_reference": "https://github.com/wholebody3d/wholebody3d/blob/main/utils/prepare_data_h3wb.py"
+  },
+  "aspset_rgb_evaluation": {
+    "name": "ASPset-510 held-out RGB/body3D evaluation clip",
+    "source": "https://github.com/anibali/aspset-510",
+    "distribution": "https://archive.org/download/aspset510/aspset510_v1_test-videos.tar.gz",
+    "archive_member": "ASPset-510/test/videos/1e28/1e28-0001-left.mkv",
+    "member_sha256": "4dba3cd1ba096390da15a5afbfea9aef23b51b57ca1460ec08e21a3b6c1c55ed",
+    "member_bytes": 26451727,
+    "acquisition": "Stream the official gzip tar from its beginning and stop after this first video member. Observed transfer was26,460,160bytes; code imposes a256MiB cap and never downloads the whole1.386GB video archive.",
+    "license": "CC0-1.0",
+    "license_url": "https://creativecommons.org/publicdomain/zero/1.0/",
+    "subject": "1e28", "clip": "0001", "camera": "left", "split": "test",
+    "source_frames": 291, "fps": 50, "source_width": 3840, "source_height": 2160,
+    "frame_alignment": "C3D first_frame0,last_frame290 and17 joints in millimeters; officialbboxCSV has291rows. The official loader uses the same zero-based frame_index for mocap, bbox and decodedvideo.",
+    "alignment_reference": "https://github.com/anibali/aspset-510/blob/master/src/aspset510/torch/__init__.py",
+    "annotation_archives": [
+      {"url": "https://archive.org/download/aspset510/aspset510_v1_test-cameras.tar.gz", "md5": "b93bd9d41206172361cec8ae0d3434d5"},
+      {"url": "https://archive.org/download/aspset510/aspset510_v1_test-joints_3d.tar.gz", "md5": "cc725af311f45d6b203cce05c5b94208"},
+      {"url": "https://archive.org/download/aspset510/aspset510_v1_test-boxes.tar.gz", "md5": "006c7f709e3e6b5fe820a5e0aa560dd7"}
+    ],
+    "modifications": "Select up to192evenlyspaced valid frames, decode actualRGB, crop from official annotatedpersonboxes using aspect0.75 and expansion1.25, resize256x192, convert body12 camera-space3D to hip-relative meters.",
+    "scope": "One held-out realRGB→body3D clip with ground-truth person crops. Person detection and whole-body hand/face/foot3D end-to-end accuracy are outside this metric.",
+    "training_usage": "Evaluation only. These test frames are not used for training, fitting or residual-noise calibration."
+  },
+  "not_separately_downloaded": ["CMU Human Foot Keypoint Dataset", "AIST++", "Human3.6M RGB images", "FreiHAND", "InterHand2.6M"]
 }
