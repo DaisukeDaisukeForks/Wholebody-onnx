@@ -19,7 +19,7 @@ permissions:
 
 concurrency:
   group: wholebody-${{ github.repository }}
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 env:
   HF_TOKEN: ${{ secrets.HF_TOKEN }}
@@ -30,8 +30,15 @@ env:
   HF_HUB_DISABLE_PROGRESS_BARS: '1'
 
 jobs:
+  redesign:
+    name: Pause training for the accuracy redesign
+    runs-on: ubuntu-24.04
+    steps:
+      - run: echo 'Training is paused while pose initialization, learning duration, 3D supervision, and publication quality criteria are revised.'
+
   bootstrap:
     name: Create Hugging Face repositories and restore training state
+    if: ${{ false }}
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     steps:
