@@ -130,7 +130,7 @@ def publish_learned(config: dict, work: Path) -> None:
     card = f"""---
 license: other
 license_name: wholebody-research
-license_link: MODEL_LICENSE.md
+license_link: https://huggingface.co/{config['hf_repo_id']}/blob/main/MODEL_LICENSE.md
 library_name: onnx
 pipeline_tag: keypoint-detection
 tags:

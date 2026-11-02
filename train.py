@@ -259,7 +259,7 @@ def bootstrap(config: dict[str, Any], work: Path) -> None:
     checkpoint_hub.create_owned(SOURCE_REPOSITORY, private=True)
     publication_hub.create_owned(SOURCE_REPOSITORY, private=False)
     if publication_hub.read("wholebody.onnx", optional=True) is None:
-        notice = ("---\nlicense: other\nlicense_name: wholebody-research\nlicense_link: MODEL_LICENSE.md\n---\n"
+        notice = (f"---\nlicense: other\nlicense_name: wholebody-research\nlicense_link: https://huggingface.co/{config['hf_repo_id']}/blob/main/MODEL_LICENSE.md\n---\n"
                   "# Pose73 learning in progress\n\n"
                   "The actual training workflow is preparing and learning this model. An ONNX release is uploaded only after the declared part-wise accuracy and inference-cost criteria pass.\n\n"
                   "[Actual progress](training_status.json) · [Source and Actions](https://github.com/DaisukeDaisuke/Wholebody-onnx)\n\n"
