@@ -76,6 +76,12 @@ Full license: [LICENSES/Apache-2.0.txt](LICENSES/Apache-2.0.txt). Copyright and 
 
 The port removes registry/runtime dependencies while retaining compatible layer definitions and parameter names. New compact outputs and lifting behavior are project modifications, not upstream performance claims.
 
+## Optional mixed-precision conversion
+
+The exporter optionally uses Microsoft's `onnxconverter-common==1.16.0`, distributed through [PyPI](https://pypi.org/project/onnxconverter-common/1.16.0/) under the [MIT License](https://github.com/microsoft/onnxconverter-common/blob/v1.16.0/LICENSE), copyright Microsoft Corporation. [Source](https://github.com/microsoft/onnxconverter-common/tree/v1.16.0) and [official conversion API](https://onnxruntime.ai/docs/performance/model-optimizations/float16.html). The conversion package is a build dependency; its license does not replace the pretrained-model or dataset conditions.
+
+Changes to the exported artifact: convert only the extracted backbone/final-convolution segment to FP16 and rejoin it with the original FP32 input normalization and FP32 GAU/SimCC/lifter/geometry. Public input/output types remain FP32. The optional file is published only after it meets the same declared held-out quality criteria. Exact precision boundaries, file hashes, sizes, evaluation provider, and reused-metric scope are recorded. CPU evaluation can promote unsupported FP16 operators to FP32 and is not evidence of native GPU behavior or performance.
+
 ## Distribution
 
 Source: [DaisukeDaisuke/Wholebody-onnx](https://github.com/DaisukeDaisuke/Wholebody-onnx).

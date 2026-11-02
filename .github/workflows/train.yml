@@ -6,6 +6,7 @@ on:
     paths:
       - '*.py'
       - 'requirements.txt'
+      - 'requirements-export.txt'
       - 'train_config.json'
       - 'data_sources.json'
       - 'MODEL_LICENSE.md'
@@ -186,6 +187,9 @@ jobs:
       - uses: ./.github/actions/python
       - name: Install the real held-out video decoder
         run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends ffmpeg
+      - name: Install the optional mixed-precision exporter
+        continue-on-error: true
+        run: python -m pip install --disable-pip-version-check -r requirements-export.txt
       - name: Evaluate the learned checkpoint and apply publication criteria
         run: python train.py publish --config train_config.json --work-dir work
       - name: Preserve measured evaluation and publication information

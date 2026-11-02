@@ -114,6 +114,10 @@ RGB条件では1つのtest動画・1台のカメラから均等に選んだ192�
 
 ## 実行と配布
 
+GPU向けの追加形式として、画像の正規化をFP32に保ち、backboneと最後の関節convをFP16へ変換する`wholebody-fp16.onnx`も用意します。GAU・SimCC・座標復元・信頼度・3D lifter・導出座標は元のFP32演算と重みを保持します。入力と6出力はFP32のままで、同じ可変batchを使います。変換する約372万パラメータにより重みの保存量は約3分の1減る見込みですが、実際のファイルサイズと精度は変換時に記録します。演算数は変わりません。
+
+追加形式は、同じ検証画像と実RGB→身体3Dの同じ精度条件を満たした場合だけ配布します。基準モデルの成績と変更していないFP32 lifterの注釈入力成績は、その再利用範囲を明示します。評価に使うCPUExecutionProviderは未対応のFP16演算をFP32へ戻す場合があるため、GPU上の数値挙動・使用率・速度を確認したとは扱いません。結果と精度の境界は`precision_report.json`、部位別の測定値は`metrics-fp16.json`に保存します。追加形式が未達でも、公開条件を満たした主形式の`wholebody.onnx`は配布できます。[変換APIの公式説明](https://onnxruntime.ai/docs/performance/model-optimizations/float16.html)
+
 Actions secretに`HF_TOKEN`を設定します。指定の`RabbitDaisuke`配下でリポジトリを作成・書き込みできる権限が必要です。作成処理はActions内で行い、トークンをソースやログへ出力しません。
 
 GitHubの **Actions → Learn and publish Pose73 ONNX** を実行します。対象コード・設定の`main`へのpushも起動対象です。データ準備、姿勢学習済み重みの読込、継続可能な並列学習、品質判定、ONNX生成、公開を進めます。再開元のステップとその後の更新、各ワーカーの寄与を記録します。

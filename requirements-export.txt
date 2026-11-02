@@ -1,0 +1,2 @@
+# Optional GPU-oriented derivative; the primary exporter uses requirements.txt.
+onnxconverter-common==1.16.0

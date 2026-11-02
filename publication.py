@@ -127,6 +127,42 @@ def publish_learned(config: dict, work: Path) -> None:
         log(work, "publish", result)
         raise RuntimeError("Declared part-wise quality criteria are unmet; trained checkpoint and candidate were retained privately")
 
+    from precision_export import export_mixed_fp16
+
+    publish_progress(config, work, {"stage": "mixed_precision_export", "step": checkpoint["step"],
+                                    "target_step": manifest["target_step"]})
+    precision = export_mixed_fp16(
+        output / "wholebody.onnx", data_root, work / "precision_candidate", metrics,
+        config["quality_gate"], validation_samples=config["validation_samples"],
+    )
+    if precision["eligible_for_publication"]:
+        for filename in precision["files_for_publication"]:
+            source = Path(filename)
+            atomic_write(output / source.name, source.read_bytes())
+    public_precision = {**precision, "files_for_publication": [Path(name).name for name in precision["files_for_publication"]]}
+    atomic_write(output / "precision_report.json", json_bytes(public_precision))
+    metrics["mixed_precision_derivative"] = {
+        "status": precision["status"], "published": precision["eligible_for_publication"],
+        "report": "precision_report.json", "native_gpu_execution_validated": False,
+    }
+    report["mixed_precision_derivative"] = metrics["mixed_precision_derivative"]
+    atomic_write(output / "metrics.json", json_bytes(metrics))
+    atomic_write(output / "training_report.json", json_bytes(report))
+    precision_section = ""
+    if precision["eligible_for_publication"]:
+        precision_section = f"""## GPU-oriented mixed-precision format
+
+[Download wholebody-fp16.onnx](https://huggingface.co/{config['hf_repo_id']}/resolve/main/wholebody-fp16.onnx).
+The backbone and final joint convolution use FP16; RGB normalization, GAU, SimCC decoding, confidence, 3D lifting and geometry remain FP32.
+The input and all six outputs retain the same FP32 interface and dynamic batch dimension.
+This file is {precision['candidate_bytes']:,} bytes, {100 * precision['file_size_reduction_fraction']:.1f}% smaller than the primary file; the model's MAC count is unchanged.
+The derivative passed the same2D and actual RGB/body3D criteria on the same held-out examples; see [metrics-fp16.json](metrics-fp16.json).
+The unchanged FP32 lifter's paired-coordinate results and the original teacher/initial baselines are reused with their scope recorded.
+Evaluation used CPUExecutionProvider, which can promote unsupported FP16 operations to FP32. Native GPU numerical behavior, utilization, throughput and latency were not measured.
+Use [precision_report.json](precision_report.json) for the exact precision boundaries, bytes, source hashes and provider scope.
+
+"""
+
     card = f"""---
 license: other
 license_name: wholebody-research
@@ -196,6 +232,7 @@ It also measures the actual RGB-to-predicted2D-to-body3D path on a held-out ASPs
 That body-only clip and the lifting measurements do not establish whole-body RGB-to-3D accuracy or production tracking performance.
 Arithmetic/parameter counts are not measured GPU utilization, camera capacity or device-specific frame rate.
 
+{precision_section}
 ## License and attribution
 
 The distribution terms for our new contributions are in [MODEL_LICENSE.md](MODEL_LICENSE.md), for noncommercial research and education.
@@ -212,14 +249,22 @@ Source distribution: https://github.com/{SOURCE_REPOSITORY}
     files = {path.relative_to(output).as_posix(): path for path in output.rglob("*") if path.is_file()}
     publication_revision = public_hub.commit(files, f"Publish learned Pose73 ONNX after declared quality criteria pass at step {checkpoint['step']}")
     anonymous = Hub(config["hf_repo_id"], token=False)
-    downloaded = anonymous.read("wholebody.onnx", revision=publication_revision)
     expected_hash = sha256((output / "wholebody.onnx").read_bytes())
-    if sha256(downloaded) != expected_hash:
-        raise RuntimeError("Public ONNX bytes differ from the exported learned model")
+    artifacts = {}
+    names = ["wholebody.onnx"] + (["wholebody-fp16.onnx"] if precision["eligible_for_publication"] else [])
+    for name in names:
+        downloaded = anonymous.read(name, revision=publication_revision)
+        expected = sha256((output / name).read_bytes())
+        if sha256(downloaded) != expected:
+            raise RuntimeError(f"Public {name} bytes differ from the qualified learned artifact")
+        artifacts[name] = {"sha256": expected, "bytes": len(downloaded),
+                           "download_url": f"https://huggingface.co/{config['hf_repo_id']}/resolve/main/{name}",
+                           "anonymous_download_succeeded": True}
     result = {"model_url": f"https://huggingface.co/{config['hf_repo_id']}",
               "download_url": f"https://huggingface.co/{config['hf_repo_id']}/resolve/main/wholebody.onnx",
               "revision": publication_revision, "onnx_sha256": expected_hash,
               "anonymous_download_succeeded": True, "quality_gate_passed": True,
+              "artifacts": artifacts,
               "common_step": checkpoint["step"], "target_reached": True, "utc": utc_now()}
     atomic_write(work / "status.json", json_bytes(result))
     public_hub.commit({"publication.json": json_bytes(result),
