@@ -22,7 +22,7 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, default_collate
 
-from data import (CocoCalibrationDataset, CocoWholeBodyDataset, LEGACY_PREPARED_FILES,
+from data import (CocoCalibrationDataset, CocoWholeBodyDataset,
                   PREPARED_FILES, Unified3DDataset, ensure_images, prepare_data)
 from hub import Hub, atomic_write, json_bytes, load_tensors, sha256, tensor_bytes, wait_json
 from model import WholeBodyModel
@@ -127,12 +127,11 @@ def prepared_bundle(data_root: Path) -> bytes:
     return memory.getvalue()
 
 
-def unpack_prepared(data: bytes, data_root: Path, *, legacy: bool = False) -> None:
+def unpack_prepared(data: bytes, data_root: Path) -> None:
     data_root.mkdir(parents=True, exist_ok=True)
     with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as archive:
         members = archive.getmembers()
-        expected = LEGACY_PREPARED_FILES if legacy else PREPARED_FILES
-        if {entry.name for entry in members} != set(expected):
+        if {entry.name for entry in members} != set(PREPARED_FILES):
             raise ValueError("Unexpected prepared-data archive members")
         for entry in members:
             if not entry.isfile():
@@ -275,25 +274,6 @@ def bootstrap(config: dict[str, Any], work: Path) -> None:
     previous_bytes = checkpoint_hub.read("state/latest.pt", revision=head, optional=True)
     prepared = checkpoint_hub.read("data/prepared.tar.gz", revision=head, optional=True)
     data_root = work / "data"
-    if prepared is None and config.get("prepared_source"):
-        # Reuse only the actual data prepared by this session's cancelled run.
-        # No model or optimizer checkpoint is read from that source repository.
-        source = config["prepared_source"]
-        source_hub = Hub(source["repo_id"])
-        source_revision = source_hub.head()
-        source_project = source_hub.read_json("project.json", revision=source_revision)
-        expected_source = {"format": 1, "source_repository": SOURCE_REPOSITORY, "project": "wholebody-parallel-a6fde3"}
-        if source_project != expected_source:
-            raise RuntimeError("Prepared data source is not this session's original preparation")
-        source_run = source_hub.read_json(f"runs/{source['run_key']}/bootstrap.json", revision=source_revision)
-        if source_run["data_sha256"] != source["sha256"]:
-            raise RuntimeError("Prepared-data provenance differs from the recorded preparation")
-        source_bytes = source_hub.read("data/prepared.tar.gz", revision=source_revision)
-        if sha256(source_bytes) != source["sha256"]:
-            raise RuntimeError("Reused prepared-data checksum mismatch")
-        unpack_prepared(source_bytes, data_root, legacy=True)
-        log(work, "bootstrap", {"event": "reused_current_session_data", "source_revision": source_revision,
-                               "source_run": source["run_key"], "sha256": source["sha256"]})
     if prepared is None:
         prepare_data(
             data_root, train_limit=config["train_limit"], val_limit=config["val_limit"],
