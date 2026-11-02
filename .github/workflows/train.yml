@@ -1,0 +1,167 @@
+name: Train and publish WholeBody ONNX
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '*.py'
+      - 'requirements.txt'
+      - 'train_config.json'
+      - 'data_sources.json'
+      - 'MODEL_CARD.md'
+      - 'MODEL_LICENSE.md'
+      - 'THIRD_PARTY.md'
+      - '.github/workflows/train.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: wholebody-${{ github.repository }}
+  cancel-in-progress: false
+
+env:
+  HF_TOKEN: ${{ secrets.HF_TOKEN }}
+  RUN_KEY: ${{ github.run_id }}-${{ github.run_attempt }}
+  OMP_NUM_THREADS: '4'
+  MKL_NUM_THREADS: '4'
+  PYTHONUNBUFFERED: '1'
+  HF_HUB_DISABLE_PROGRESS_BARS: '1'
+
+jobs:
+  bootstrap:
+    name: Create Hugging Face repositories and restore training state
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: requirements.txt
+      - name: Install CPU training dependencies
+        run: |
+          python -m pip install --disable-pip-version-check torch==2.9.0 torchvision==0.24.0 --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install --disable-pip-version-check -r requirements.txt
+      - name: Initialize or resume the shared model
+        run: python train.py bootstrap --config train_config.json --work-dir work
+      - name: Preserve bootstrap logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bootstrap-${{ github.run_id }}-${{ github.run_attempt }}
+          retention-days: 7
+          if-no-files-found: ignore
+          path: |
+            work/logs/
+            work/status.json
+
+  phase1:
+    name: Phase 1 / worker ${{ matrix.rank }}
+    needs: bootstrap
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        rank: [0, 1]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: requirements.txt
+      - name: Install CPU training dependencies
+        run: |
+          python -m pip install --disable-pip-version-check torch==2.9.0 torchvision==0.24.0 --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install --disable-pip-version-check -r requirements.txt
+      - name: Train the common model on a real data shard
+        run: python train.py worker --config train_config.json --work-dir work --phase 1 --rank ${{ matrix.rank }}
+      - name: Preserve worker logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: phase1-worker${{ matrix.rank }}-${{ github.run_id }}-${{ github.run_attempt }}
+          retention-days: 7
+          if-no-files-found: ignore
+          path: |
+            work/logs/
+            work/status.json
+
+  phase2:
+    name: Phase 2 / worker ${{ matrix.rank }}
+    needs: [bootstrap, phase1]
+    if: ${{ always() && needs.bootstrap.result == 'success' && !cancelled() }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        rank: [0, 1]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: requirements.txt
+      - name: Install CPU training dependencies
+        run: |
+          python -m pip install --disable-pip-version-check torch==2.9.0 torchvision==0.24.0 --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install --disable-pip-version-check -r requirements.txt
+      - name: Continue from the durable optimizer checkpoint
+        run: python train.py worker --config train_config.json --work-dir work --phase 2 --rank ${{ matrix.rank }}
+      - name: Preserve worker logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: phase2-worker${{ matrix.rank }}-${{ github.run_id }}-${{ github.run_attempt }}
+          retention-days: 7
+          if-no-files-found: ignore
+          path: |
+            work/logs/
+            work/status.json
+
+  publish:
+    name: Export learned ONNX and publish with licenses
+    needs: [bootstrap, phase1, phase2]
+    if: ${{ always() && needs.bootstrap.result == 'success' && !cancelled() }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: requirements.txt
+      - name: Install CPU training and ONNX dependencies
+        run: |
+          python -m pip install --disable-pip-version-check torch==2.9.0 torchvision==0.24.0 --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install --disable-pip-version-check -r requirements.txt
+      - name: Export and publish the learned model
+        run: python train.py publish --config train_config.json --work-dir work
+      - name: Preserve publication information
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: publication-${{ github.run_id }}-${{ github.run_attempt }}
+          retention-days: 7
+          if-no-files-found: ignore
+          path: |
+            work/logs/
+            work/status.json
+            work/release/*.json

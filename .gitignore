@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+.venv/
+work/
+data-cache/
+release/
+*.pt
+*.onnx
+*.tar.gz
+.env

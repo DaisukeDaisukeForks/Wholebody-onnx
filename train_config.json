@@ -1,0 +1,27 @@
+{
+  "hf_repo_id": "RabbitDaisuke/Wholebody-Parallel-20261102-a6fde3",
+  "checkpoint_repo_id": "RabbitDaisuke/Wholebody-Parallel-20261102-a6fde3-checkpoints",
+  "workers": 2,
+  "seed": 20261102,
+  "rounds_per_phase": 128,
+  "batch2d": 8,
+  "batch3d": 128,
+  "accumulate": 8,
+  "loss3d_weight": 1.0,
+  "learning_rate": 0.001,
+  "weight_decay": 0.01,
+  "clip_grad_norm": 1.0,
+  "train_limit": 8192,
+  "val_limit": 256,
+  "max_3d_frames": 60000,
+  "frame_stride": 5,
+  "worker_minutes": 300,
+  "worker_wait_minutes": 45,
+  "model": {
+    "freeze_backbone": true,
+    "image_height": 192,
+    "image_width": 144,
+    "head_channels": 64,
+    "lifter_width": 256
+  }
+}
