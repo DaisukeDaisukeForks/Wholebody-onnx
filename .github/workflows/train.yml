@@ -19,7 +19,7 @@ permissions:
 
 concurrency:
   group: wholebody-${{ github.repository }}
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 env:
   HF_TOKEN: ${{ secrets.HF_TOKEN }}
@@ -30,8 +30,15 @@ env:
   HF_HUB_DISABLE_PROGRESS_BARS: '1'
 
 jobs:
+  redesign:
+    name: Stop superseded 133-point training
+    runs-on: ubuntu-24.04
+    steps:
+      - run: echo 'The 133-point training run is superseded by the requested inference-cost redesign.'
+
   bootstrap:
     name: Create Hugging Face repositories and restore training state
+    if: ${{ false }}
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     steps:
