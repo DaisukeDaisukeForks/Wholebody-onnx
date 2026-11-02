@@ -12,7 +12,7 @@
     "image_terms": "https://cocodataset.org/#termsofuse",
     "authors": "Sheng Jin, Lumin Xu, Jin Xu, Can Wang, Wentao Liu, Chen Qian, Wanli Ouyang and Ping Luo; annotations owned by SenseTime Research",
     "citation": "Jin et al. Whole-Body Human Pose Estimation in the Wild. ECCV 2020.",
-    "modifications": "Person crops, resizing, normalized 133-keypoint labels, invalid annotation exclusion. Per-image license IDs and original source URLs are retained in dataset_manifest.json."
+    "modifications": "Keep the source's 133-label annotation indexing in prepared metadata, then select only the 73 declared body, finger, foot and face targets for model supervision. Person crops, resizing, coordinate normalization and invalid annotation exclusion. No duplicate hand-root outputs. Per-image license IDs and original source URLs are retained in dataset_manifest.json."
   },
   "aspset510": {
     "name": "ASPset-510 v1",

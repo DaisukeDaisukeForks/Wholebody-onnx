@@ -1,6 +1,12 @@
 {
-  "hf_repo_id": "RabbitDaisuke/Wholebody-Parallel-20261102-a6fde3",
-  "checkpoint_repo_id": "RabbitDaisuke/Wholebody-Parallel-20261102-a6fde3-checkpoints",
+  "hf_repo_id": "RabbitDaisuke/Wholebody-Compact-20261102-a6fde3",
+  "checkpoint_repo_id": "RabbitDaisuke/Wholebody-Compact-20261102-a6fde3-checkpoints",
+  "joint_schema": "compact73-coco-wholebody-v1",
+  "prepared_source": {
+    "repo_id": "RabbitDaisuke/Wholebody-Parallel-20261102-a6fde3-checkpoints",
+    "run_key": "41435918079-1",
+    "sha256": "2a267745eebeede8981471f8bde987849724f9bb51ff90bd03da69488a3600fe"
+  },
   "workers": 2,
   "seed": 20261102,
   "rounds_per_phase": 128,
@@ -21,7 +27,8 @@
     "freeze_backbone": true,
     "image_height": 192,
     "image_width": 144,
-    "head_channels": 64,
-    "lifter_width": 256
+    "head_channels": 32,
+    "lifter_width": 128,
+    "heatmap_sigma": 0.75
   }
 }

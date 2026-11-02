@@ -1,4 +1,4 @@
-"""WholeBody heatmaps and supervised, hip-relative 3D lifting.
+"""Compact body, finger, foot and face localization with supervised 3D lifting.
 
 RGB inputs are person crops in [0, 1]. ImageNet normalization is internal.
 The backbone's BatchNorm statistics never change on an individual worker.
@@ -12,46 +12,27 @@ import torch
 from torch import Tensor, nn
 from torch.nn import functional as F
 from torchvision.models import MobileNet_V3_Small_Weights, mobilenet_v3_small
-
-
-BODY_2D_NAMES = [
-    "nose", "left_eye", "right_eye", "left_ear", "right_ear",
-    "left_shoulder", "right_shoulder", "left_elbow", "right_elbow",
-    "left_wrist", "right_wrist", "left_hip", "right_hip",
-    "left_knee", "right_knee", "left_ankle", "right_ankle",
-]
-FOOT_NAMES = [
-    "left_big_toe", "left_small_toe", "left_heel",
-    "right_big_toe", "right_small_toe", "right_heel",
-]
-HAND_NAMES = ["wrist"] + [
-    f"{finger}_{joint}" for finger in ("thumb", "index", "middle", "ring", "pinky")
-    for joint in range(1, 5)
-]
-WHOLEBODY_NAMES = (
-    BODY_2D_NAMES + FOOT_NAMES + [f"face_{i:02d}" for i in range(68)]
-    + [f"left_hand_{name}" for name in HAND_NAMES]
-    + [f"right_hand_{name}" for name in HAND_NAMES]
+from joint_schema import (
+    BODY_3D_COCO_IDS, BODY_3D_NAMES, COMPACT_COCO_IDS,
+    COMPACT_JOINT_NAMES, GEOMETRY2D_NAMES, GEOMETRY2D_SCHEMA,
+    GEOMETRY2D_WEIGHTS, JOINT_SCHEMA,
 )
-BODY_3D_COCO_IDS = list(range(5, 17))
-BODY_3D_NAMES = [BODY_2D_NAMES[i] for i in BODY_3D_COCO_IDS]
 BACKBONE_WEIGHTS_URL = "https://download.pytorch.org/models/mobilenet_v3_small-047dcff4.pth"
 DEFAULT_CONFIG: dict[str, Any] = {
     "image_height": 192,
     "image_width": 144,
-    "head_channels": 64,
-    "lifter_width": 256,
+    "head_channels": 32,
+    "lifter_width": 128,
     "freeze_backbone": True,
-    "heatmap_sigma": 1.5,
+    "heatmap_sigma": 0.75,
     "backbone_weights": "none",
 }
 
 
-def _conv_norm(in_channels: int, out_channels: int, kernel: int = 1) -> nn.Sequential:
+def _conv_relu(in_channels: int, out_channels: int, kernel: int = 1, groups: int = 1) -> nn.Sequential:
     return nn.Sequential(
-        nn.Conv2d(in_channels, out_channels, kernel, padding=kernel // 2, bias=False),
-        nn.GroupNorm(8, out_channels),
-        nn.SiLU(),
+        nn.Conv2d(in_channels, out_channels, kernel, padding=kernel // 2, groups=groups, bias=True),
+        nn.ReLU(),
     )
 
 
@@ -59,8 +40,8 @@ class ResidualLinear(nn.Module):
     def __init__(self, width: int) -> None:
         super().__init__()
         self.layers = nn.Sequential(
-            nn.Linear(width, width), nn.LayerNorm(width), nn.ReLU(),
-            nn.Linear(width, width), nn.LayerNorm(width), nn.ReLU(),
+            nn.Linear(width, width), nn.ReLU(),
+            nn.Linear(width, width), nn.ReLU(),
         )
 
     def forward(self, x: Tensor) -> Tensor:
@@ -73,7 +54,7 @@ class BodyLifter(nn.Module):
     def __init__(self, width: int, aspect: float) -> None:
         super().__init__()
         self.register_buffer("aspect_scale", torch.tensor([aspect, 1.0]).view(1, 1, 2))
-        self.input_layer = nn.Sequential(nn.Linear(24, width), nn.LayerNorm(width), nn.ReLU())
+        self.input_layer = nn.Sequential(nn.Linear(24, width), nn.ReLU())
         self.blocks = nn.Sequential(ResidualLinear(width), ResidualLinear(width))
         self.output_layer = nn.Linear(width, 36)
 
@@ -94,40 +75,46 @@ class WholeBodyModel(nn.Module):
         self.config = {**DEFAULT_CONFIG, **(config or {})}
         height, width = int(self.config["image_height"]), int(self.config["image_width"])
         channels = int(self.config["head_channels"])
-        if height % 4 or width % 4 or channels % 8:
-            raise ValueError("Image dimensions must be divisible by 4; head_channels by 8")
+        if height % 8 or width % 8 or channels <= 0:
+            raise ValueError("Image dimensions must be divisible by 8; head_channels must be positive")
         weights = MobileNet_V3_Small_Weights.IMAGENET1K_V1 if pretrained else None
-        self.backbone = mobilenet_v3_small(weights=weights).features
+        # Keep the pretrained stride-8 and stride-16 features. Later classification
+        # blocks and the 576-channel final expansion are not part of this model.
+        self.backbone = mobilenet_v3_small(weights=weights).features[:9]
         if pretrained:
             self.config["backbone_weights"] = "MobileNet_V3_Small_Weights.IMAGENET1K_V1"
         self.freeze_backbone = bool(self.config["freeze_backbone"])
         if self.freeze_backbone:
             self.backbone.requires_grad_(False)
         self.backbone.eval()
-        # Official torchvision feature indices: strides 4, 8, 16, 32.
-        self.laterals = nn.ModuleList([_conv_norm(c, channels) for c in (16, 24, 48, 576)])
+        self.low_projection = _conv_relu(24, channels)
+        self.high_projection = _conv_relu(48, channels)
         self.refine = nn.Sequential(
-            nn.Conv2d(channels, channels, 3, padding=1, groups=channels, bias=False),
-            nn.GroupNorm(8, channels), nn.SiLU(),
-            _conv_norm(channels, channels),
-            nn.Conv2d(channels, channels, 3, padding=1, groups=channels, bias=False),
-            nn.GroupNorm(8, channels), nn.SiLU(),
-            _conv_norm(channels, channels),
+            _conv_relu(channels, channels, 3, groups=channels),
+            _conv_relu(channels, channels),
         )
-        self.heatmap_head = nn.Conv2d(channels, 133, 1)
-        nn.init.normal_(self.heatmap_head.weight, std=0.01)
-        nn.init.zeros_(self.heatmap_head.bias)
+        self.joint_count = len(COMPACT_COCO_IDS)
+        # One shared convolution produces one location score and two subcell
+        # offsets per joint. Finger tips remain independent supervised outputs.
+        self.pose_head = nn.Conv2d(channels, self.joint_count * 3, 1)
+        nn.init.normal_(self.pose_head.weight, std=0.01)
+        nn.init.zeros_(self.pose_head.bias)
         self.lifter = BodyLifter(int(self.config["lifter_width"]), width / height)
         self.register_buffer("image_mean", torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
         self.register_buffer("image_std", torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
-        self.heatmap_height, self.heatmap_width = height // 4, width // 4
+        self.heatmap_height, self.heatmap_width = height // 8, width // 8
         grid_y, grid_x = torch.meshgrid(
             torch.linspace(0.0, 1.0, self.heatmap_height),
             torch.linspace(0.0, 1.0, self.heatmap_width), indexing="ij",
         )
         self.register_buffer("coordinate_grid", torch.stack((grid_x, grid_y), dim=-1).reshape(-1, 2))
         self.register_buffer("heatmap_scale", torch.tensor([self.heatmap_width - 1, self.heatmap_height - 1]))
-        self.register_buffer("body_ids", torch.tensor(BODY_3D_COCO_IDS, dtype=torch.long))
+        self.register_buffer("body_ids", torch.arange(12, dtype=torch.long))
+        self.register_buffer("geometry_weights", torch.tensor(GEOMETRY2D_WEIGHTS, dtype=torch.float32))
+        self.register_buffer("geometry_source_mask", self.geometry_weights != 0)
+        self.register_buffer("geometry_scale", torch.tensor(
+            [row["coordinate_scale"] for row in GEOMETRY2D_SCHEMA["rows"]], dtype=torch.float32,
+        ).unsqueeze(0))
 
     def train(self, mode: bool = True) -> "WholeBodyModel":
         super().train(mode)
@@ -137,35 +124,49 @@ class WholeBodyModel(nn.Module):
                 module.eval()
         return self
 
-    def forward_heatmaps(self, rgb: Tensor) -> Tensor:
+    def forward_pose(self, rgb: Tensor) -> tuple[Tensor, Tensor]:
         x = (rgb - self.image_mean) / self.image_std
-        features: list[Tensor] = []
+        low_feature = x
         for index, layer in enumerate(self.backbone):
             x = layer(x)
-            if index in (1, 3, 8, 12):
-                features.append(x)
-        pyramid = self.laterals[3](features[3])
-        for index in (2, 1, 0):
-            lateral = self.laterals[index](features[index])
-            pyramid = lateral + F.interpolate(pyramid, size=lateral.shape[-2:], mode="bilinear", align_corners=False)
-        return self.heatmap_head(self.refine(pyramid))
+            if index == 3:
+                low_feature = x
+        low = self.low_projection(low_feature)
+        high = self.high_projection(x)
+        fused = low + F.interpolate(high, size=low.shape[-2:], mode="bilinear", align_corners=False)
+        raw = self.pose_head(self.refine(fused))
+        logits = raw[:, :self.joint_count]
+        offsets = raw[:, self.joint_count:].reshape(-1, self.joint_count, 2, self.heatmap_height, self.heatmap_width).tanh()
+        return logits, offsets
 
-    def decode_heatmaps(self, logits: Tensor) -> tuple[Tensor, Tensor]:
+    def forward_heatmaps(self, rgb: Tensor) -> Tensor:
+        return self.forward_pose(rgb)[0]
+
+    def decode_heatmaps(self, logits: Tensor, offsets: Tensor) -> tuple[Tensor, Tensor]:
         probability = logits.flatten(2).softmax(dim=-1)
-        keypoints = torch.matmul(probability, self.coordinate_grid)
         # Peak probability is a concentration score, not calibrated visibility.
-        confidence = probability.max(dim=-1).values
-        return keypoints, confidence
+        confidence, indices = probability.max(dim=-1)
+        base = self.coordinate_grid[indices]
+        selected = offsets.flatten(3).gather(3, indices[:, :, None, None].expand(-1, -1, 2, 1)).squeeze(-1)
+        points = (base + selected / self.heatmap_scale).clamp(0.0, 1.0)
+        return points, confidence
 
     def lift_body(self, crop_xy: Tensor) -> Tensor:
         return self.lifter(crop_xy)
 
-    def forward(self, rgb: Tensor) -> tuple[Tensor, Tensor, Tensor]:
-        points, confidence = self.decode_heatmaps(self.forward_heatmaps(rgb))
-        return points, confidence, self.lift_body(points.index_select(1, self.body_ids))
+    def derived_geometry(self, points: Tensor, confidence: Tensor) -> tuple[Tensor, Tensor]:
+        # Fixed source weights live in joint_schema.py, shared with documentation.
+        geometry = torch.matmul(self.geometry_weights, points) * self.geometry_scale
+        source_scores = torch.where(self.geometry_source_mask[None, :, :], confidence[:, None, :], torch.ones_like(confidence[:, None, :]))
+        return geometry, source_scores.amin(dim=-1)
+
+    def forward(self, rgb: Tensor) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+        points, confidence = self.decode_heatmaps(*self.forward_pose(rgb))
+        geometry, geometry_confidence = self.derived_geometry(points, confidence)
+        return points, confidence, self.lift_body(points.index_select(1, self.body_ids)), geometry, geometry_confidence
 
     def loss_2d(self, batch: dict[str, Tensor]) -> tuple[Tensor, dict[str, Tensor]]:
-        logits = self.forward_heatmaps(batch["image"])
+        logits, offsets = self.forward_pose(batch["image"])
         target = batch["keypoints"]
         visible = batch["visibility"] > 0
         visible = visible & torch.isfinite(target).all(dim=-1) & (target >= 0).all(dim=-1) & (target <= 1).all(dim=-1)
@@ -174,13 +175,19 @@ class WholeBodyModel(nn.Module):
         target_distribution = torch.exp(-distance.square().sum(dim=-1) / (2 * float(self.config["heatmap_sigma"]) ** 2))
         target_distribution = target_distribution / target_distribution.sum(dim=-1, keepdim=True).clamp_min(1e-12)
         cross_entropy = -(target_distribution * logits.flatten(2).log_softmax(dim=-1)).sum(dim=-1)
+        # Local offsets receive real coordinate supervision around each target.
+        # This retains subcell precision with a small stride-8 score tensor.
+        local_weight = target_distribution * (distance.abs().amax(dim=-1) <= 1.0).to(target_distribution.dtype)
+        local_weight = local_weight / local_weight.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+        offset_target = (-distance).clamp(-1, 1).permute(0, 1, 3, 2)
+        offset_error = F.smooth_l1_loss(offsets.flatten(3), offset_target, reduction="none", beta=0.2).mean(dim=2)
+        offset_loss = (offset_error * local_weight).sum(dim=-1)
         weight = visible.to(cross_entropy.dtype)
         count = weight.sum(dim=-1).clamp_min(1)
-        per_sample = (cross_entropy * weight).sum(dim=-1) / count
-        points, _ = self.decode_heatmaps(logits)
+        per_sample = ((cross_entropy + offset_loss) * weight).sum(dim=-1) / count
+        points, _ = self.decode_heatmaps(logits, offsets)
         distance_xy = (points - safe_target).square().sum(dim=-1).sqrt()
-        coordinate_loss = ((points - safe_target).abs().sum(dim=-1) * weight).sum(dim=-1) / count
-        loss = (per_sample + coordinate_loss).mean()
+        loss = per_sample.mean()
         return loss, {
             "loss2d": loss.detach(),
             "mean_xy_error": ((distance_xy * weight).sum() / weight.sum().clamp_min(1)).detach(),
@@ -207,20 +214,25 @@ class WholeBodyModel(nn.Module):
 
     def specification(self) -> dict[str, Any]:
         return {
-            "format_version": 1,
-            "architecture": "MobileNetV3-small feature pyramid + 133 heatmaps + supervised 12-joint 3D lifter",
+            "format_version": 2,
+            "architecture": "Truncated MobileNetV3-small blocks 0..8, shared stride-8 compact location/offset head, supervised 12-joint 3D lifter",
             "config": self.config,
             "input": {"name": "image", "dtype": "float32", "shape": ["batch", 3, self.config["image_height"], self.config["image_width"]],
                       "color": "RGB", "range": [0, 1], "normalization": "ImageNet mean/std are applied inside the model",
                       "crop": f"Single-person crop, width/height={self.config['image_width'] / self.config['image_height']}; resize without changing aspect ratio"},
             "outputs": [
-                {"name": "keypoints2d", "shape": ["batch", 133, 2], "coordinates": "x right, y down; normalized to crop [0,1]",
-                 "joint_names": WHOLEBODY_NAMES},
-                {"name": "confidence2d", "shape": ["batch", 133], "meaning": "Maximum spatial softmax probability; concentration score, not calibrated visibility"},
+                {"name": "keypoints2d", "shape": ["batch", self.joint_count, 2], "coordinates": "x right, y down; normalized to crop [0,1]",
+                 "joint_names": COMPACT_JOINT_NAMES, "source_coco_ids": COMPACT_COCO_IDS},
+                {"name": "confidence2d", "shape": ["batch", self.joint_count], "meaning": "Maximum spatial softmax probability; concentration score, not calibrated visibility"},
                 {"name": "body3d", "shape": ["batch", 12, 3], "unit": "meter", "coordinates": "camera x right, y down, z away",
                  "root": "midpoint of left_hip and right_hip", "joint_names": BODY_3D_NAMES,
                  "source_coco_ids": BODY_3D_COCO_IDS,
                  "scope": "Relative articulated body pose only; absolute camera distance and root translation are not predicted"},
+                {"name": "geometry2d", "shape": ["batch", 8, 2], "names": GEOMETRY2D_NAMES,
+                 "definitions": GEOMETRY2D_SCHEMA,
+                 "scope": "Derived hand reference centers and hand/foot axes; no independently labeled hand-back surface, sole surface, or 3D sole normal"},
+                {"name": "geometry_confidence", "shape": ["batch", 8],
+                 "meaning": "Minimum concentration score of the joints used in each derived quantity; not calibrated visibility. Geometry requires reliable source joints."},
             ],
             "initial_weights": {
                 "name": self.config["backbone_weights"],
@@ -228,7 +240,9 @@ class WholeBodyModel(nn.Module):
                 "code_license": "torchvision BSD-3-Clause",
                 "terms": "Pretrained weights have separate data-derived terms; see THIRD_PARTY.md and MODEL_LICENSE.md",
             },
-            "supervision": {"2d": "COCO-WholeBody 133 joints; absent labels excluded",
+            "joint_schema": JOINT_SCHEMA,
+            "batching": "Each batch entry is an independent person/camera crop; no cross-entry normalization or temporal state",
+            "supervision": {"2d": "Selected 73 COCO-WholeBody joints; absent labels excluded",
                             "3d": "ASPset-510 real 3D joints projected through calibrated cameras; only 12 anatomically matching joints",
                             "missing3d": "No synthetic 3D supervision for face, fingers, toe tips, or heels"},
         }

@@ -23,6 +23,8 @@ import torch
 from PIL import Image
 from torch.utils.data import Dataset
 
+from joint_schema import COMPACT_COCO_IDS, COMPACT_JOINT_NAMES, JOINT_SCHEMA
+
 IMAGE_HEIGHT = 192
 IMAGE_WIDTH = 144
 COCO_BODY_IDS = tuple(range(5, 17))
@@ -308,11 +310,14 @@ def _crop_box(box):
 
 
 class CocoWholeBodyDataset(Dataset):
-    """RGB crops and only the valid 133-point 2D labels (no invented 3D labels)."""
+    """RGB crops with 73 selected real labels from the unchanged 133-point cache."""
     def __init__(self, root, split="train"):
         self.root, self.split = Path(root), split
         self.manifest = _read_json(self.root / f"coco_{split}.json")
         self.samples = self.manifest["samples"]
+        self.joint_ids = np.asarray(COMPACT_COCO_IDS, dtype=np.int64)
+        self.joint_names = list(COMPACT_JOINT_NAMES)
+        self.joint_schema = JOINT_SCHEMA
 
     def __len__(self):
         return len(self.samples)
@@ -328,7 +333,7 @@ class CocoWholeBodyDataset(Dataset):
                 tuple(float(value) for value in box), resample=Image.Resampling.BILINEAR,
             )
             rgb = np.asarray(image, dtype=np.float32).transpose(2, 0, 1).copy() / 255.0
-        points = np.asarray(sample["keypoints"], dtype=np.float32)
+        points = np.asarray(sample["keypoints"], dtype=np.float32)[self.joint_ids]
         xy = (points[:, :2] - box[:2]) / (box[2:] - box[:2])
         valid = (points[:, 2] > 0) & (xy >= 0).all(axis=-1) & (xy <= 1).all(axis=-1)
         # Invalid labels are numerically benign and their loss contribution is zero.
@@ -439,6 +444,7 @@ def prepare_aspset(root, frame_stride=5, max_frames=60000):
                     or abs(intrinsic[2, 2]) < 1e-12):
                 raise ValueError("ASPset calibration has an unsupported projective depth axis")
             depth_sign = 1.0 if np.median(camera_xyz[valid, :, 2]) > 0 else -1.0
+            valid &= (camera_xyz[..., 2] * depth_sign > 1e-6).all(axis=1)
             axes = np.asarray((np.sign(intrinsic[0, 0] / intrinsic[2, 2]) * depth_sign,
                                np.sign(intrinsic[1, 1] / intrinsic[2, 2]) * depth_sign, depth_sign))
             if not np.all(np.abs(axes) == 1):
@@ -450,6 +456,8 @@ def prepare_aspset(root, frame_stride=5, max_frames=60000):
             size = upper - lower
             height = np.maximum(size[:, 1], size[:, 0] * IMAGE_HEIGHT / IMAGE_WIDTH) * 1.25
             valid &= height > 1e-6
+            if not valid.any():
+                continue
             crop_size = np.stack((height * IMAGE_WIDTH / IMAGE_HEIGHT, height), axis=-1)
             origin = (lower + upper - crop_size) / 2
             normalized = (xy - origin[:, None]) / np.maximum(crop_size[:, None], 1e-6)
@@ -470,6 +478,8 @@ def prepare_aspset(root, frame_stride=5, max_frames=60000):
         points = np.concatenate(values["keypoints"])
         targets = np.concatenate(values["target3d"])
         sample_ids = np.asarray(values["sample_ids"])
+        if len(points) == 0:
+            raise RuntimeError(f"No nondegenerate ASPset-510 {split} frames")
         # Uniform deterministic sampling spans all clips instead of taking one subject.
         limit = max_frames if split == "train" else max(1, min(max_frames, 6000))
         if len(points) > limit:

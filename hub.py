@@ -121,7 +121,7 @@ class Hub:
         if not self.repo_id.startswith("RabbitDaisuke/"):
             raise ValueError("The requested publication namespace is RabbitDaisuke")
         marker_path = "project.json"
-        expected = {"format": 1, "source_repository": source_repo, "project": "wholebody-parallel-a6fde3"}
+        expected = {"format": 1, "source_repository": source_repo, "project": "wholebody-compact-a6fde3"}
         try:
             info = self.api.repo_info(self.repo_id, repo_type="model")
         except RepositoryNotFoundError:
